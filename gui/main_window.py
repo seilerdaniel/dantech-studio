@@ -82,7 +82,18 @@ class DanTechStudioApp(ctk.CTk):
     """
 
     def __init__(self) -> None:
-        """Build the window, the sidebar and the six views, then start telemetry."""
+        """Build the window, the sidebar and the six views, then start telemetry.
+
+        Automatic DPI-aware scaling is deactivated BEFORE any widget exists:
+        on Windows it can leave the scale factor as None, which crashes
+        CTkTextbox creation inside ``_apply_widget_scaling`` with a TypeError
+        ("'NoneType' and 'float'"). Forcing a fixed scale keeps the layout
+        deterministic across monitors.
+        """
+        ctk.deactivate_automatic_dpi_awareness()
+        ctk.set_widget_scaling(1.0)
+        ctk.set_window_scaling(1.0)
+
         super().__init__(fg_color="#1a1a1a")
 
         self.title("DanTech Studio")
@@ -462,9 +473,15 @@ class DanTechStudioApp(ctk.CTk):
         return ctk.CTkLabel(parent, text=text, font=("Segoe UI", 22, "bold"))
 
     def _section_log(
-        self, parent: ctk.CTkFrame, row: int, height: Optional[int] = None
+        self, parent: ctk.CTkFrame, row: int, height: int = 240
     ) -> ctk.CTkTextbox:
-        """Create the standard readonly log textbox for a view."""
+        """Create the standard readonly log textbox for a view.
+
+        Note: never pass ``height=None`` to CTkTextbox — CustomTkinter 6.0.0
+        scales the desired height and crashes with
+        "unsupported operand type(s) for *: 'NoneType' and 'float'"
+        in ``_apply_widget_scaling``.
+        """
         log = ctk.CTkTextbox(parent, wrap="word", state="disabled", height=height)
         log.grid(row=row, column=0, sticky="nsew", padx=16, pady=16)
         log.tag_config("info", foreground=_LOG_COLOR_INFO)
