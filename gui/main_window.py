@@ -28,10 +28,17 @@ from typing import Any, Callable, Optional, Sequence
 
 import customtkinter as ctk
 from customtkinter import filedialog
-from tkinter import TclError
+from tkinter import TclError, messagebox
 
+from core.app_uninstaller import (
+    AppUninstaller,
+    ResidualEntry,
+    UninstallEntry,
+    UninstallResult,
+)
 from core.audit import audit
 from core.data_recovery import DataRecovery, EXTENSION_GROUPS, RecoveryJobResult
+from core.driver_manager import DriverInfo, DriverManager, DriverUpdateResult
 from core.disk_analyzer import DiskAnalyzer, DiskHealth, DiskUsage
 from core.installer import Installer, WingetResult
 from core.malware_cleaner import MalwareCleaner, ScanReport
@@ -44,6 +51,12 @@ from core.memory_optimizer import (
 from core.network_diagnostic import NetworkDiagnostic, NetworkResetResult, PingResult
 from core.report_generator import ActionRecord, ReportGenerator
 from core.startup_manager import BootInfo, StartupActionResult, StartupEntry, StartupManager
+from core.system_cleaner import (
+    CleanAnalysisReport,
+    CleanConfig,
+    CleanResult,
+    SystemCleaner,
+)
 from core.system_repair import RepairReport, SystemRepair
 from utils import process_runner
 from utils.process_runner import CommandResult
@@ -87,6 +100,17 @@ _NAV_INACTIVE_FG: str = "transparent"
 #: Log line colors.
 _LOG_COLOR_INFO: str = "#dce4ee"
 _LOG_COLOR_ERROR: str = "#ff6b6b"
+
+#: Spanish labels for the SystemCleaner cleanup categories (GUI translation).
+_CLEANER_CATEGORY_LABELS: dict[str, str] = {
+    "temp_user": "Temporales de usuario",
+    "temp_system": "Temporales del sistema",
+    "prefetch": "Prefetch",
+    "software_distribution": "SoftwareDistribution",
+    "recycle_bin": "Papelera",
+    "browser_cache_chrome": "Cache Chrome",
+    "browser_cache_edge": "Cache Edge",
+}
 
 #: Status banner / indicator colors (success, warning, failure).
 _COLOR_OK: str = "#4caf50"
@@ -143,12 +167,17 @@ class DanTechStudioApp(ctk.CTk):
         self._recovery_manager = DataRecovery()
         self._network_diagnostic = NetworkDiagnostic()
         self._startup_manager = StartupManager()
+        self._system_cleaner = SystemCleaner()
+        self._app_uninstaller = AppUninstaller()
+        self._driver_manager = DriverManager()
 
         self._active_buttons: list[Any] = []
         self._active_progress: Optional[Any] = None
         self._views: dict[str, ctk.CTkFrame] = {}
         self._nav_buttons: dict[str, ctk.CTkButton] = {}
         self._startup_entries: list[StartupEntry] = []
+        self._uninstall_entries: list[UninstallEntry] = []
+        self._uninstall_residuals: list[ResidualEntry] = []
         self._qr_window: Optional[ctk.CTkToplevel] = None
         self._qr_images: list[Any] = []
 
@@ -1001,77 +1030,200 @@ class DanTechStudioApp(ctk.CTk):
     # ---------------------------------------------------------------- memoria
 
     def _build_memory(self) -> ctk.CTkFrame:
-        """Build the memory optimization view."""
+        """Build the memory/cleanup view: configurable SystemCleaner plus RAM."""
         frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(5, weight=1)
+        frame.grid_rowconfigure(2, weight=1)
 
         title = self._section_title(frame, "Optimización de memoria")
         title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
 
         description = ctk.CTkLabel(
             frame,
-            text="Limpia archivos temporales y libera memoria RAM sin cerrar procesos.",
+            text="Analiza y limpia archivos temporales/cachés de forma selectiva "
+            "y libera memoria RAM sin cerrar procesos.",
             font=("Segoe UI", 12),
             text_color="#8a8a8a",
         )
-        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
 
-        self._memory_progress = ctk.CTkProgressBar(frame, mode="indeterminate")
-        self._memory_progress.set(0)
-        self._memory_progress.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        main = ctk.CTkFrame(frame, fg_color="transparent")
+        main.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 4))
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_rowconfigure(0, weight=1)
 
-        buttons_row = ctk.CTkFrame(frame, fg_color="transparent")
-        buttons_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 4))
+        config = ctk.CTkFrame(main)
+        config.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+        config.grid_columnconfigure(0, weight=1)
+
+        config_title = ctk.CTkLabel(
+            config, text="Configuración y Filtros", font=("Segoe UI", 14, "bold")
+        )
+        config_title.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+
+        self._memory_flags: dict[str, ctk.CTkCheckBox] = {}
+        for index, (category, label) in enumerate(
+            _CLEANER_CATEGORY_LABELS.items(), start=1
+        ):
+            checkbox = ctk.CTkCheckBox(config, text=label)
+            checkbox.grid(row=index, column=0, sticky="w", padx=12, pady=3)
+            self._memory_flags[category] = checkbox
+        self._memory_flags["temp_user"].select()
+        self._memory_flags["temp_system"].select()
+
+        exclusions_label = ctk.CTkLabel(
+            config, text="Exclusiones (una ruta por línea):", font=("Segoe UI", 12)
+        )
+        exclusions_label.grid(row=8, column=0, sticky="w", padx=12, pady=(8, 2))
+
+        self._memory_exclusions = ctk.CTkTextbox(config, height=70)
+        self._memory_exclusions.grid(row=9, column=0, sticky="ew", padx=12, pady=(0, 8))
+
+        reset_memory_btn = ctk.CTkButton(
+            config,
+            text="Restablecer Configuración por Defecto",
+            command=self._memory_reset_config,
+        )
+        reset_memory_btn.grid(row=10, column=0, sticky="ew", padx=12, pady=(4, 12))
+
+        actions = ctk.CTkFrame(main)
+        actions.grid(row=0, column=1, sticky="nsew")
+        actions.grid_columnconfigure(0, weight=1)
+        actions.grid_rowconfigure(3, weight=1)
+
+        actions_title = ctk.CTkLabel(
+            actions, text="Acciones y Consola", font=("Segoe UI", 14, "bold")
+        )
+        actions_title.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+
+        buttons_row = ctk.CTkFrame(actions, fg_color="transparent")
+        buttons_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 4))
         buttons_row.grid_columnconfigure(3, weight=1)
 
-        clean_temp_btn = ctk.CTkButton(
-            buttons_row, text="Limpiar temporales", command=self._memory_clean_temp
+        analyze_btn = ctk.CTkButton(
+            buttons_row, text="Analizar", command=self._memory_analyze
         )
-        clean_temp_btn.grid(row=0, column=0, padx=(0, 8))
+        analyze_btn.grid(row=0, column=0, padx=(0, 8))
 
-        clean_ram_btn = ctk.CTkButton(
-            buttons_row, text="Limpiar RAM", command=self._memory_clean_ram
+        apply_btn = ctk.CTkButton(
+            buttons_row,
+            text="Aplicar Cambios",
+            fg_color=_NAV_ACTIVE_FG,
+            hover_color="#155a8a",
+            command=self._memory_apply,
         )
-        clean_ram_btn.grid(row=0, column=1, padx=8)
+        apply_btn.grid(row=0, column=1, padx=8)
 
-        optimize_btn = ctk.CTkButton(
+        ram_btn = ctk.CTkButton(
             buttons_row, text="Optimizar todo", command=self._memory_optimize_all
         )
-        optimize_btn.grid(row=0, column=2, padx=8)
+        ram_btn.grid(row=0, column=2, padx=8)
 
-        self._memory_buttons = [clean_temp_btn, clean_ram_btn, optimize_btn]
+        self._memory_buttons = [analyze_btn, apply_btn, ram_btn]
 
-        self._memory_log = self._section_log(frame, row=5)
+        self._memory_progress = ctk.CTkProgressBar(actions, mode="indeterminate")
+        self._memory_progress.set(0)
+        self._memory_progress.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 4))
+
+        self._memory_log = ctk.CTkTextbox(
+            actions, wrap="word", state="disabled", height=200
+        )
+        self._memory_log.grid(row=3, column=0, sticky="nsew", padx=12, pady=(4, 12))
+        self._memory_log.tag_config("info", foreground=_LOG_COLOR_INFO)
+        self._memory_log.tag_config("error", foreground=_LOG_COLOR_ERROR)
+
         return frame
 
-    def _memory_clean_temp(self) -> None:
-        """Run the temporary-folder cleanup in the background."""
+    def _memory_build_config(self) -> CleanConfig:
+        """Assemble a CleanConfig from the current filter widgets."""
+        return CleanConfig(
+            temp_user=self._memory_flags["temp_user"].get() == 1,
+            temp_system=self._memory_flags["temp_system"].get() == 1,
+            prefetch=self._memory_flags["prefetch"].get() == 1,
+            software_distribution=self._memory_flags["software_distribution"].get() == 1,
+            recycle_bin=self._memory_flags["recycle_bin"].get() == 1,
+            browser_cache_chrome=self._memory_flags["browser_cache_chrome"].get() == 1,
+            browser_cache_edge=self._memory_flags["browser_cache_edge"].get() == 1,
+            whitelist_paths=tuple(
+                line.strip()
+                for line in self._memory_exclusions.get("1.0", "end").splitlines()
+                if line.strip()
+            ),
+        )
+
+    def _memory_reset_config(self) -> None:
+        """Restore the default cleanup filters and clear the exclusions."""
+        for category in _CLEANER_CATEGORY_LABELS:
+            if category in ("temp_user", "temp_system"):
+                self._memory_flags[category].select()
+            else:
+                self._memory_flags[category].deselect()
+        self._memory_exclusions.delete("1.0", "end")
+        self._append_log(self._memory_log, "Configuración de limpieza restablecida.")
+
+    def _memory_analyze(self) -> None:
+        """Run a read-only SystemCleaner analysis in the background."""
+        config = self._memory_build_config()
         self._launch(
-            "Limpiar archivos temporales",
+            "Analizar espacio recuperable",
             self._memory_buttons,
             self._memory_progress,
             self._memory_log,
-            lambda complete, fail: self._memory_optimizer.clean_temp_folders_async(
-                on_complete=complete, on_error=fail
+            lambda complete, fail: self._system_cleaner.analyze_only_async(
+                config, on_complete=complete, on_error=fail
             ),
-            self._memory_cleanup_done,
+            self._memory_analyze_done,
             self._memory_error,
         )
 
-    def _memory_clean_ram(self) -> None:
-        """Run the RAM working-set trim in the background."""
+    def _memory_analyze_done(self, report: CleanAnalysisReport) -> None:
+        """Log the analysis totals and the per-category breakdown."""
+        self._end_operation(self._memory_buttons, self._memory_progress)
+        audit("clean_analyze", f"total={report.total_bytes} files={report.file_count}")
+        self._append_log(
+            self._memory_log,
+            f"Análisis: {self._format_size(report.total_bytes)} a liberar "
+            f"en {report.file_count:,} archivos.",
+        )
+        for category, total in report.category_totals.items():
+            label = _CLEANER_CATEGORY_LABELS.get(category, category)
+            self._append_log(self._memory_log, f"  {label}: {self._format_size(total)}")
+        for error in report.errors:
+            hint = self._admin_hint(error)
+            self._append_log(self._memory_log, hint or error, error=True)
+        self._append_log(self._memory_log, f"Tiempo: {report.elapsed:.2f} s")
+
+    def _memory_apply(self) -> None:
+        """Run a real SystemCleaner pass with the current filters."""
+        config = self._memory_build_config()
         self._launch(
-            "Limpiar memoria RAM",
+            "Aplicar cambios de limpieza",
             self._memory_buttons,
             self._memory_progress,
             self._memory_log,
-            lambda complete, fail: self._memory_optimizer.cleanup_ram_async(
-                on_complete=complete, on_error=fail
+            lambda complete, fail: self._system_cleaner.clean_now_async(
+                config, on_complete=complete, on_error=fail
             ),
-            self._memory_ram_done,
+            self._memory_apply_done,
             self._memory_error,
         )
+
+    def _memory_apply_done(self, result: CleanResult) -> None:
+        """Log the cleanup outcome and the per-category freed space."""
+        self._end_operation(self._memory_buttons, self._memory_progress)
+        audit("clean_now", f"freed={result.total_freed} files={result.files_deleted}")
+        self._append_log(
+            self._memory_log,
+            f"Limpieza: {self._format_size(result.total_freed)} liberados "
+            f"({result.files_deleted:,} archivos).",
+        )
+        for category, freed in result.category_freed.items():
+            label = _CLEANER_CATEGORY_LABELS.get(category, category)
+            self._append_log(self._memory_log, f"  {label}: {self._format_size(freed)}")
+        for error in result.errors:
+            hint = self._admin_hint(error)
+            self._append_log(self._memory_log, hint or error, error=True)
+        self._append_log(self._memory_log, f"Tiempo: {result.elapsed:.2f} s")
 
     def _memory_optimize_all(self) -> None:
         """Run temp cleanup plus RAM trim in one background pass."""
@@ -1086,20 +1238,6 @@ class DanTechStudioApp(ctk.CTk):
             self._memory_all_done,
             self._memory_error,
         )
-
-    def _memory_cleanup_done(self, report: CleanupReport) -> None:
-        """Log the outcome of a temp-folder cleanup."""
-        self._end_operation(self._memory_buttons, self._memory_progress)
-        self._append_log(self._memory_log, "Limpieza de temporales completada.")
-        for line in self._format_cleanup_report(report):
-            self._append_log(self._memory_log, line)
-
-    def _memory_ram_done(self, report: RamReport) -> None:
-        """Log the outcome of a RAM cleanup."""
-        self._end_operation(self._memory_buttons, self._memory_progress)
-        self._append_log(self._memory_log, "Limpieza de RAM completada.")
-        for line in self._format_ram_report(report):
-            self._append_log(self._memory_log, line)
 
     def _memory_all_done(self, report: CombinedReport) -> None:
         """Log the outcome of the combined optimization pass."""
@@ -1117,10 +1255,10 @@ class DanTechStudioApp(ctk.CTk):
     # -------------------------------------------------------------- reparación
 
     def _build_repair(self) -> ctk.CTkFrame:
-        """Build the system repair view."""
+        """Build the system repair view: SFC/DISM/network plus a drivers section."""
         frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(5, weight=1)
+        frame.grid_rowconfigure(3, weight=1)
 
         title = self._section_title(frame, "Reparación del sistema")
         title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
@@ -1132,40 +1270,173 @@ class DanTechStudioApp(ctk.CTk):
             font=("Segoe UI", 12),
             text_color="#8a8a8a",
         )
-        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
 
-        self._repair_progress = ctk.CTkProgressBar(frame, mode="indeterminate")
+        main = ctk.CTkFrame(frame, fg_color="transparent")
+        main.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 4))
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_rowconfigure(0, weight=1)
+
+        repair_col = ctk.CTkFrame(main)
+        repair_col.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+        repair_col.grid_columnconfigure(0, weight=1)
+
+        repair_header = ctk.CTkLabel(
+            repair_col, text="Reparación", font=("Segoe UI", 14, "bold")
+        )
+        repair_header.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+
+        self._repair_progress = ctk.CTkProgressBar(repair_col, mode="indeterminate")
         self._repair_progress.set(0)
-        self._repair_progress.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        self._repair_progress.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
 
-        buttons_row = ctk.CTkFrame(frame, fg_color="transparent")
-        buttons_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 4))
-        buttons_row.grid_columnconfigure(3, weight=1)
-
-        sfc_btn = ctk.CTkButton(buttons_row, text="SFC /scannow", command=self._repair_sfc)
-        sfc_btn.grid(row=0, column=0, padx=(0, 8))
+        sfc_btn = ctk.CTkButton(repair_col, text="SFC /scannow", command=self._repair_sfc)
+        sfc_btn.grid(row=2, column=0, sticky="ew", padx=12, pady=3)
 
         dism_btn = ctk.CTkButton(
-            buttons_row, text="DISM RestoreHealth", command=self._repair_dism
+            repair_col, text="DISM RestoreHealth", command=self._repair_dism
         )
-        dism_btn.grid(row=0, column=1, padx=8)
+        dism_btn.grid(row=3, column=0, sticky="ew", padx=12, pady=3)
 
         network_btn = ctk.CTkButton(
-            buttons_row, text="Restablecer red", command=self._repair_network
+            repair_col, text="Restablecer red", command=self._repair_network
         )
-        network_btn.grid(row=0, column=2, padx=8)
+        network_btn.grid(row=4, column=0, sticky="ew", padx=12, pady=3)
 
         restore_btn = ctk.CTkButton(
-            buttons_row,
+            repair_col,
             text="Crear punto de restauración",
             command=self._repair_restore_point,
         )
-        restore_btn.grid(row=0, column=3, padx=8)
+        restore_btn.grid(row=5, column=0, sticky="ew", padx=12, pady=(3, 12))
 
         self._repair_buttons = [sfc_btn, dism_btn, network_btn, restore_btn]
 
-        self._repair_log = self._section_log(frame, row=5)
+        drivers_col = ctk.CTkFrame(main)
+        drivers_col.grid(row=0, column=1, sticky="nsew")
+        drivers_col.grid_columnconfigure(0, weight=1)
+
+        drivers_header = ctk.CTkLabel(
+            drivers_col, text="Drivers", font=("Segoe UI", 14, "bold")
+        )
+        drivers_header.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+
+        drivers_info = ctk.CTkLabel(
+            drivers_col,
+            text="Lista los drivers firmados y fuerza un rescan de hardware. "
+            "La consulta puede tardar 15-30 segundos.",
+            font=("Segoe UI", 12),
+            text_color="#8a8a8a",
+            justify="left",
+            wraplength=380,
+        )
+        drivers_info.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+
+        list_btn = ctk.CTkButton(drivers_col, text="Listar drivers", command=self._drivers_list)
+        list_btn.grid(row=2, column=0, sticky="ew", padx=12, pady=3)
+
+        self._drivers_restore_switch = ctk.CTkSwitch(
+            drivers_col, text="Crear punto de restauración antes"
+        )
+        self._drivers_restore_switch.select()
+        self._drivers_restore_switch.grid(row=3, column=0, sticky="w", padx=12, pady=3)
+
+        update_btn = ctk.CTkButton(
+            drivers_col,
+            text="Actualizar drivers (best effort)",
+            fg_color=_NAV_ACTIVE_FG,
+            hover_color="#155a8a",
+            command=self._drivers_update,
+        )
+        update_btn.grid(row=4, column=0, sticky="ew", padx=12, pady=3)
+
+        reset_drivers_btn = ctk.CTkButton(
+            drivers_col,
+            text="Restablecer Configuración por Defecto",
+            command=self._drivers_reset,
+        )
+        reset_drivers_btn.grid(row=5, column=0, sticky="ew", padx=12, pady=(3, 8))
+
+        self._drivers_buttons = [list_btn, update_btn]
+        self._drivers_progress = ctk.CTkProgressBar(drivers_col, mode="indeterminate")
+        self._drivers_progress.set(0)
+        self._drivers_progress.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 12))
+
+        self._repair_log = self._section_log(frame, row=3)
         return frame
+
+    def _drivers_list(self) -> None:
+        """List signed drivers in the background."""
+        self._launch(
+            "Listar drivers",
+            self._drivers_buttons,
+            self._drivers_progress,
+            self._repair_log,
+            lambda complete, fail: self._driver_manager.list_drivers_async(
+                on_complete=complete, on_error=fail
+            ),
+            self._drivers_list_done,
+            self._repair_error,
+        )
+
+    def _drivers_list_done(self, payload: tuple[list[DriverInfo], list[str]]) -> None:
+        """Log the driver count and the first five rows."""
+        self._end_operation(self._drivers_buttons, self._drivers_progress)
+        infos, errors = payload
+        self._append_log(self._repair_log, f"Drivers encontrados: {len(infos)}.")
+        for error in errors:
+            self._append_log(self._repair_log, error, error=True)
+        for info in infos[:5]:
+            self._append_log(
+                self._repair_log,
+                f"  {info.device_name} | {info.driver_version} | {info.manufacturer}",
+            )
+        if len(infos) > 5:
+            self._append_log(self._repair_log, f"  ... y {len(infos) - 5} más.")
+
+    def _drivers_update(self) -> None:
+        """Run the best-effort driver update sequence in the background."""
+        create_restore = self._drivers_restore_switch.get() == 1
+        self._launch(
+            "Actualizar drivers (best effort)",
+            self._drivers_buttons,
+            self._drivers_progress,
+            self._repair_log,
+            lambda complete, fail: self._driver_manager.update_drivers_async(
+                create_restore, on_complete=complete, on_error=fail
+            ),
+            self._drivers_update_done,
+            self._repair_error,
+        )
+
+    def _drivers_update_done(self, result: DriverUpdateResult) -> None:
+        """Log the restore-point outcome and each update step."""
+        self._end_operation(self._drivers_buttons, self._drivers_progress)
+        audit(
+            "drivers_update",
+            f"restore={result.restore_point_created} success={result.success}",
+        )
+        if result.restore_point_created:
+            self._append_log(
+                self._repair_log, "Punto de restauración creado correctamente."
+            )
+        elif result.restore_point_error:
+            self._append_log(self._repair_log, result.restore_point_error, error=True)
+        for step in result.steps:
+            self._append_log(
+                self._repair_log,
+                f"{'OK' if step.result.success else 'FAIL'}: {step.label}",
+            )
+        self._append_log(
+            self._repair_log,
+            "Actualización de drivers: "
+            + ("completada." if result.success else "finalizada con errores."),
+        )
+
+    def _drivers_reset(self) -> None:
+        """Restore the drivers section defaults (restore-point switch ON)."""
+        self._drivers_restore_switch.select()
+        self._append_log(self._repair_log, "Configuración de drivers restablecida.")
 
     def _repair_sfc(self) -> None:
         """Run ``sfc /scannow`` in the background."""
@@ -1254,202 +1525,620 @@ class DanTechStudioApp(ctk.CTk):
 
     def _repair_error(self, error: Any) -> None:
         """Log a repair-operation error (also handles the admin-required case)."""
-        self._end_operation(self._repair_buttons, self._repair_progress)
+        self._end_operation(self._active_buttons, self._active_progress)
         self._log_error(self._repair_log, error)
 
     # --------------------------------------------------------------- seguridad
 
     def _build_security(self) -> ctk.CTkFrame:
-        """Build the security (Windows Defender) view."""
+        """Build the security view: Defender scans plus hosts management."""
         frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(7, weight=1)
+        frame.grid_rowconfigure(2, weight=1)
 
         title = self._section_title(frame, "Seguridad")
         title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
 
         description = ctk.CTkLabel(
             frame,
-            text="Escaneos con Windows Defender y actualización de firmas. "
+            text="Escaneos con Windows Defender y administración del archivo hosts. "
             "Requieren administrador.",
             font=("Segoe UI", 12),
             text_color="#8a8a8a",
         )
-        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
 
-        self._security_progress = ctk.CTkProgressBar(frame, mode="indeterminate")
-        self._security_progress.set(0)
-        self._security_progress.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        main = ctk.CTkFrame(frame, fg_color="transparent")
+        main.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 4))
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_rowconfigure(0, weight=1)
 
-        buttons_row = ctk.CTkFrame(frame, fg_color="transparent")
-        buttons_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 4))
-        buttons_row.grid_columnconfigure(3, weight=1)
+        config = ctk.CTkFrame(main)
+        config.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+        config.grid_columnconfigure(0, weight=1)
 
-        update_btn = ctk.CTkButton(
-            buttons_row, text="Actualizar firmas", command=self._security_update_signatures
+        config_title = ctk.CTkLabel(
+            config, text="Configuración", font=("Segoe UI", 14, "bold")
         )
-        update_btn.grid(row=0, column=0, padx=(0, 8))
+        config_title.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
 
-        quick_btn = ctk.CTkButton(
-            buttons_row, text="Análisis rápido", command=self._security_quick_scan
+        scan_label = ctk.CTkLabel(config, text="Tipo de escaneo:", font=("Segoe UI", 12))
+        scan_label.grid(row=1, column=0, sticky="w", padx=12, pady=(4, 2))
+
+        self._security_scan_type = ctk.CTkComboBox(
+            config, values=["Rápido", "Completo", "Custom"], width=200
         )
-        quick_btn.grid(row=0, column=1, padx=8)
+        self._security_scan_type.set("Rápido")
+        self._security_scan_type.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 6))
 
-        full_btn = ctk.CTkButton(
-            buttons_row, text="Análisis completo", command=self._security_full_scan
+        folder_label = ctk.CTkLabel(
+            config, text="Ruta (solo Custom):", font=("Segoe UI", 12)
         )
-        full_btn.grid(row=0, column=2, padx=8)
-
-        custom_row = ctk.CTkFrame(frame, fg_color="transparent")
-        custom_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 4))
-        custom_row.grid_columnconfigure(0, weight=1)
+        folder_label.grid(row=3, column=0, sticky="w", padx=12, pady=(4, 2))
 
         self._security_folder_entry = ctk.CTkEntry(
-            custom_row, placeholder_text="Ruta de archivo o carpeta (ej: C:\\Users\\Usuario)"
+            config, placeholder_text="C:\\Users\\Usuario\\Carpeta"
         )
-        self._security_folder_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._security_folder_entry.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 6))
 
-        custom_btn = ctk.CTkButton(
-            custom_row, text="Análisis personalizado", command=self._security_custom_scan
+        self._security_update_signatures_switch = ctk.CTkSwitch(
+            config, text="Actualizar firmas antes de escanear"
         )
-        custom_btn.grid(row=0, column=1)
+        self._security_update_signatures_switch.select()
+        self._security_update_signatures_switch.grid(
+            row=5, column=0, sticky="w", padx=12, pady=4
+        )
 
-        self._security_buttons = [update_btn, quick_btn, full_btn, custom_btn]
+        reset_security_btn = ctk.CTkButton(
+            config,
+            text="Restablecer Configuración por Defecto",
+            command=self._security_reset_config,
+        )
+        reset_security_btn.grid(row=6, column=0, sticky="ew", padx=12, pady=(8, 12))
 
-        self._security_log = self._section_log(frame, row=7)
+        actions = ctk.CTkFrame(main)
+        actions.grid(row=0, column=1, sticky="nsew")
+        actions.grid_columnconfigure(0, weight=1)
+        actions.grid_rowconfigure(3, weight=1)
+
+        actions_title = ctk.CTkLabel(
+            actions, text="Acciones y Consola", font=("Segoe UI", 14, "bold")
+        )
+        actions_title.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+
+        scan_btn = ctk.CTkButton(
+            actions,
+            text="Escanear ahora",
+            fg_color=_NAV_ACTIVE_FG,
+            hover_color="#155a8a",
+            command=self._security_scan_now,
+        )
+        scan_btn.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 4))
+
+        self._security_buttons = [scan_btn]
+
+        self._security_progress = ctk.CTkProgressBar(actions, mode="indeterminate")
+        self._security_progress.set(0)
+        self._security_progress.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 4))
+
+        self._security_log = ctk.CTkTextbox(
+            actions, wrap="word", state="disabled", height=190
+        )
+        self._security_log.grid(row=3, column=0, sticky="nsew", padx=12, pady=(4, 12))
+        self._security_log.tag_config("info", foreground=_LOG_COLOR_INFO)
+        self._security_log.tag_config("error", foreground=_LOG_COLOR_ERROR)
+
+        hosts = ctk.CTkFrame(frame)
+        hosts.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 12))
+        hosts.grid_columnconfigure(2, weight=1)
+
+        hosts_header = ctk.CTkLabel(
+            hosts, text="Archivo hosts", font=("Segoe UI", 14, "bold")
+        )
+        hosts_header.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+
+        view_hosts_btn = ctk.CTkButton(
+            hosts, text="Ver hosts", command=self._security_view_hosts
+        )
+        view_hosts_btn.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 12))
+
+        restore_hosts_btn = ctk.CTkButton(
+            hosts,
+            text="Restaurar hosts por defecto",
+            fg_color=_COLOR_WARN,
+            hover_color="#d68910",
+            command=self._security_restore_hosts,
+        )
+        restore_hosts_btn.grid(row=1, column=1, sticky="w", padx=12, pady=(0, 12))
+
+        self._hosts_buttons = [view_hosts_btn, restore_hosts_btn]
+        self._hosts_progress = ctk.CTkProgressBar(hosts, mode="indeterminate")
+        self._hosts_progress.set(0)
+        self._hosts_progress.grid(row=1, column=2, sticky="ew", padx=(0, 12), pady=(0, 12))
+
         return frame
 
-    def _security_update_signatures(self) -> None:
-        """Update Defender signatures in the background."""
-        self._launch(
-            "Actualizar firmas",
-            self._security_buttons,
-            self._security_progress,
-            self._security_log,
-            lambda complete, fail: self._malware_cleaner.update_signatures_async(
-                on_complete=complete, on_error=fail
-            ),
-            self._security_done,
-            self._security_error,
-        )
+    def _security_reset_config(self) -> None:
+        """Restore the security defaults: Rápido scan and signatures ON."""
+        self._security_scan_type.set("Rápido")
+        self._security_folder_entry.delete(0, "end")
+        self._security_update_signatures_switch.select()
+        self._append_log(self._security_log, "Configuración de seguridad restablecida.")
 
-    def _security_quick_scan(self) -> None:
-        """Run a quick Defender scan in the background."""
-        self._launch(
-            "Análisis rápido",
-            self._security_buttons,
-            self._security_progress,
-            self._security_log,
-            lambda complete, fail: self._malware_cleaner.quick_scan_async(
-                on_complete=complete, on_error=fail
-            ),
-            self._security_done,
-            self._security_error,
-        )
-
-    def _security_full_scan(self) -> None:
-        """Run a full Defender scan in the background."""
-        self._launch(
-            "Análisis completo",
-            self._security_buttons,
-            self._security_progress,
-            self._security_log,
-            lambda complete, fail: self._malware_cleaner.full_scan_async(
-                on_complete=complete, on_error=fail
-            ),
-            self._security_done,
-            self._security_error,
-        )
-
-    def _security_custom_scan(self) -> None:
-        """Run a custom Defender scan of the entered path in the background."""
+    def _security_scan_now(self) -> None:
+        """Run the configured Defender scan, updating signatures first if set."""
+        scan_kind = self._security_scan_type.get().strip()
         folder = self._security_folder_entry.get().strip()
-        if not folder:
-            self._append_log(self._security_log, "Ingresa una ruta válida.", error=True)
+        if scan_kind == "Custom" and not folder:
+            self._append_log(
+                self._security_log, "Ingresa una ruta para el escaneo Custom.", error=True
+            )
+            return
+        if self._security_update_signatures_switch.get() == 1:
+            self._begin_operation(self._security_buttons, self._security_progress)
+            self._append_log(self._security_log, "Actualizando firmas de Defender...")
+
+            def _after(report: Any) -> None:
+                try:
+                    self.after(0, self._security_signatures_done, report, scan_kind, folder)
+                except TclError:
+                    pass
+
+            try:
+                self._malware_cleaner.update_signatures_async(
+                    on_complete=_after, on_error=_after
+                )
+            except Exception as exc:
+                self._end_operation(self._security_buttons, self._security_progress)
+                self._append_log(
+                    self._security_log,
+                    f"No se pudo iniciar la actualización: {exc}",
+                    error=True,
+                )
+            return
+        self._security_run_scan(scan_kind, folder)
+
+    def _security_signatures_done(
+        self, report: ScanReport, scan_kind: str, folder: str
+    ) -> None:
+        """Log the signature update result and continue with the scan."""
+        for line in self._format_scan_report(report):
+            self._append_log(self._security_log, line)
+        self._security_run_scan(scan_kind, folder)
+
+    def _security_run_scan(self, scan_kind: str, folder: str) -> None:
+        """Launch the actual Defender scan for the selected kind."""
+        if scan_kind == "Completo":
+            label = "Análisis completo"
+            starter: Callable[[Callable[[Any], None], Callable[[Any], None]], threading.Thread] = (
+                lambda complete, fail: self._malware_cleaner.full_scan_async(
+                    on_complete=complete, on_error=fail
+                )
+            )
+        elif scan_kind == "Custom":
+            label = f"Análisis personalizado: {folder}"
+            starter = (
+                lambda complete, fail: self._malware_cleaner.custom_scan_async(
+                    folder, on_complete=complete, on_error=fail
+                )
+            )
+        else:
+            label = "Análisis rápido"
+            starter = (
+                lambda complete, fail: self._malware_cleaner.quick_scan_async(
+                    on_complete=complete, on_error=fail
+                )
+            )
+        self._launch(
+            label,
+            self._security_buttons,
+            self._security_progress,
+            self._security_log,
+            starter,
+            lambda report: self._security_scan_done(report, scan_kind),
+            self._security_error,
+        )
+
+    def _security_scan_done(self, report: ScanReport, scan_kind: str) -> None:
+        """Log a Defender scan outcome."""
+        self._end_operation(self._security_buttons, self._security_progress)
+        audit("defender_scan", f"type={scan_kind}")
+        self._append_log(
+            self._security_log, f"Operación '{report.scan_type}' finalizada."
+        )
+        for line in self._format_scan_report(report):
+            self._append_log(self._security_log, line)
+
+    def _security_view_hosts(self) -> None:
+        """Read and log the first lines of the hosts file."""
+        self._launch(
+            "Ver archivo hosts",
+            self._hosts_buttons,
+            self._hosts_progress,
+            self._security_log,
+            lambda complete, fail: self._malware_cleaner.read_hosts_async(
+                on_complete=complete, on_error=fail
+            ),
+            self._security_hosts_read_done,
+            self._security_error,
+        )
+
+    def _security_hosts_read_done(self, payload: tuple[str, list[str]]) -> None:
+        """Log the hosts content (first 30 lines) and any read errors."""
+        self._end_operation(self._hosts_buttons, self._hosts_progress)
+        content, errors = payload
+        for error in errors:
+            self._append_log(self._security_log, error, error=True)
+        lines = content.splitlines()
+        for line in lines[:30]:
+            self._append_log(self._security_log, line)
+        if len(lines) > 30:
+            self._append_log(self._security_log, f"... y {len(lines) - 30} líneas más.")
+
+    def _security_restore_hosts(self) -> None:
+        """Restore the default hosts file after confirmation (backup first)."""
+        if not messagebox.askyesno(
+            "Restaurar hosts",
+            "Se reemplazará el archivo hosts por el predeterminado. Se hace un "
+            "respaldo primero. ¿Continuar?",
+        ):
             return
         self._launch(
-            f"Análisis personalizado: {folder}",
-            self._security_buttons,
-            self._security_progress,
+            "Restaurar hosts por defecto",
+            self._hosts_buttons,
+            self._hosts_progress,
             self._security_log,
-            lambda complete, fail: self._malware_cleaner.custom_scan_async(
-                folder, on_complete=complete, on_error=fail
+            lambda complete, fail: self._malware_cleaner.restore_hosts_default_async(
+                on_complete=complete, on_error=fail
             ),
-            self._security_done,
+            self._security_hosts_restore_done,
             self._security_error,
         )
 
-    def _security_done(self, report: ScanReport) -> None:
-        """Log the outcome of a Defender scan."""
-        self._end_operation(self._security_buttons, self._security_progress)
-        self._append_log(self._security_log, f"Operación '{report.scan_type}' finalizada.")
-        for line in self._format_scan_report(report):
+    def _security_hosts_restore_done(self, result: CommandResult) -> None:
+        """Log the hosts restore outcome."""
+        self._end_operation(self._hosts_buttons, self._hosts_progress)
+        audit("hosts_restore", f"success={result.success}")
+        for line in self._format_command_result(result):
             self._append_log(self._security_log, line)
 
     def _security_error(self, error: Any) -> None:
         """Log a security-operation error."""
-        self._end_operation(self._security_buttons, self._security_progress)
+        self._end_operation(self._active_buttons, self._active_progress)
         self._log_error(self._security_log, error)
 
     # ------------------------------------------------------------------- apps
 
     def _build_apps(self) -> ctk.CTkFrame:
-        """Build the apps (winget) view."""
+        """Build the apps view: winget installer plus an uninstaller section."""
         frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(7, weight=1)
+        frame.grid_rowconfigure(4, weight=1)
 
         title = self._section_title(frame, "Aplicaciones")
         title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
 
         description = ctk.CTkLabel(
             frame,
-            text="Busca, instala y actualiza programas con winget (Windows Package Manager).",
+            text="Busca, instala y actualiza programas con winget (Windows Package "
+            "Manager) y desinstala aplicaciones Win32 o UWP.",
             font=("Segoe UI", 12),
             text_color="#8a8a8a",
         )
-        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
 
-        self._apps_progress = ctk.CTkProgressBar(frame, mode="indeterminate")
-        self._apps_progress.set(0)
-        self._apps_progress.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        main = ctk.CTkFrame(frame, fg_color="transparent")
+        main.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 4))
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_rowconfigure(0, weight=1)
 
-        search_row = ctk.CTkFrame(frame, fg_color="transparent")
-        search_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 4))
-        search_row.grid_columnconfigure(0, weight=1)
+        install_col = ctk.CTkFrame(main)
+        install_col.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+        install_col.grid_columnconfigure(0, weight=1)
+
+        install_header = ctk.CTkLabel(
+            install_col, text="Instalador (winget)", font=("Segoe UI", 14, "bold")
+        )
+        install_header.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
 
         self._apps_search_entry = ctk.CTkEntry(
-            search_row, placeholder_text="Buscar paquete (ej: Firefox)"
+            install_col, placeholder_text="Buscar paquete (ej: Firefox)"
         )
-        self._apps_search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._apps_search_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=3)
 
-        search_btn = ctk.CTkButton(search_row, text="Buscar", command=self._apps_search)
-        search_btn.grid(row=0, column=1)
-
-        install_row = ctk.CTkFrame(frame, fg_color="transparent")
-        install_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 4))
-        install_row.grid_columnconfigure(0, weight=1)
+        search_btn = ctk.CTkButton(install_col, text="Buscar", command=self._apps_search)
+        search_btn.grid(row=2, column=0, sticky="ew", padx=12, pady=3)
 
         self._apps_install_entry = ctk.CTkEntry(
-            install_row, placeholder_text="ID del paquete (ej: Microsoft.PowerToys)"
+            install_col, placeholder_text="ID del paquete (ej: Microsoft.PowerToys)"
         )
-        self._apps_install_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._apps_install_entry.grid(row=3, column=0, sticky="ew", padx=12, pady=3)
 
-        install_btn = ctk.CTkButton(install_row, text="Instalar", command=self._apps_install)
-        install_btn.grid(row=0, column=1)
-
-        upgrade_row = ctk.CTkFrame(frame, fg_color="transparent")
-        upgrade_row.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 4))
+        install_btn = ctk.CTkButton(install_col, text="Instalar", command=self._apps_install)
+        install_btn.grid(row=4, column=0, sticky="ew", padx=12, pady=3)
 
         upgrade_all_btn = ctk.CTkButton(
-            upgrade_row, text="Actualizar todo", command=self._apps_upgrade_all
+            install_col, text="Actualizar todo", command=self._apps_upgrade_all
         )
-        upgrade_all_btn.grid(row=0, column=0, sticky="w")
+        upgrade_all_btn.grid(row=5, column=0, sticky="ew", padx=12, pady=(3, 12))
 
         self._apps_buttons = [search_btn, install_btn, upgrade_all_btn]
 
-        self._apps_log = self._section_log(frame, row=7)
+        uninstall_col = ctk.CTkFrame(main)
+        uninstall_col.grid(row=0, column=1, sticky="nsew")
+        uninstall_col.grid_columnconfigure(0, weight=1)
+
+        uninstall_header = ctk.CTkLabel(
+            uninstall_col, text="Desinstalador", font=("Segoe UI", 14, "bold")
+        )
+        uninstall_header.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+
+        kind_label = ctk.CTkLabel(uninstall_col, text="Tipo:", font=("Segoe UI", 12))
+        kind_label.grid(row=1, column=0, sticky="w", padx=12, pady=(4, 2))
+
+        self._apps_uninstall_kind = ctk.CTkComboBox(
+            uninstall_col, values=["Win32", "UWP (AppX)"], width=180
+        )
+        self._apps_uninstall_kind.set("Win32")
+        self._apps_uninstall_kind.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 6))
+
+        load_btn = ctk.CTkButton(
+            uninstall_col, text="Cargar programas", command=self._apps_uninstall_load
+        )
+        load_btn.grid(row=3, column=0, sticky="ew", padx=12, pady=3)
+
+        self._apps_uninstall_combo = ctk.CTkComboBox(uninstall_col, values=[])
+        self._apps_uninstall_combo.grid(row=4, column=0, sticky="ew", padx=12, pady=3)
+
+        self._apps_uninstall_silent = ctk.CTkSwitch(uninstall_col, text="Modo silencioso")
+        self._apps_uninstall_silent.select()
+        self._apps_uninstall_silent.grid(row=5, column=0, sticky="w", padx=12, pady=3)
+
+        self._apps_uninstall_deep = ctk.CTkSwitch(uninstall_col, text="Limpieza profunda")
+        self._apps_uninstall_deep.grid(row=6, column=0, sticky="w", padx=12, pady=3)
+
+        uninstall_btn = ctk.CTkButton(
+            uninstall_col,
+            text="Desinstalar seleccionado",
+            fg_color=_NAV_ACTIVE_FG,
+            hover_color="#155a8a",
+            command=self._apps_uninstall_selected,
+        )
+        uninstall_btn.grid(row=7, column=0, sticky="ew", padx=12, pady=(6, 3))
+
+        self._apps_uninstall_residuals_btn = ctk.CTkButton(
+            uninstall_col,
+            text="Eliminar residuales",
+            command=self._apps_remove_residuals,
+        )
+        self._apps_uninstall_residuals_btn.grid(
+            row=8, column=0, sticky="ew", padx=12, pady=3
+        )
+        self._apps_uninstall_residuals_btn.grid_remove()
+
+        reset_apps_btn = ctk.CTkButton(
+            uninstall_col,
+            text="Restablecer Configuración por Defecto",
+            command=self._apps_reset_config,
+        )
+        reset_apps_btn.grid(row=9, column=0, sticky="ew", padx=12, pady=(6, 12))
+
+        self._apps_uninstall_buttons = [
+            load_btn,
+            uninstall_btn,
+            self._apps_uninstall_residuals_btn,
+        ]
+
+        self._apps_progress = ctk.CTkProgressBar(frame, mode="indeterminate")
+        self._apps_progress.set(0)
+        self._apps_progress.grid(row=3, column=0, sticky="ew", padx=16, pady=4)
+
+        self._apps_log = self._section_log(frame, row=4, height=200)
         return frame
+
+    def _apps_reset_config(self) -> None:
+        """Restore the uninstaller defaults: Win32, silent ON, deep OFF."""
+        self._apps_uninstall_kind.set("Win32")
+        self._apps_uninstall_combo.set("")
+        self._apps_uninstall_silent.select()
+        self._apps_uninstall_deep.deselect()
+        self._uninstall_entries = []
+        self._uninstall_residuals = []
+        self._apps_uninstall_residuals_btn.grid_remove()
+        self._append_log(self._apps_log, "Configuración de desinstalador restablecida.")
+
+    def _apps_uninstall_load(self) -> None:
+        """Load installed programs for the selected kind in the background."""
+        kind = self._apps_uninstall_kind.get().strip()
+        if kind.startswith("UWP"):
+            title = "Cargar paquetes UWP (AppX)"
+            starter: Callable[[Callable[[Any], None], Callable[[Any], None]], threading.Thread] = (
+                lambda complete, fail: self._app_uninstaller.list_appx_async(
+                    on_complete=complete, on_error=fail
+                )
+            )
+        else:
+            title = "Cargar programas Win32"
+            starter = (
+                lambda complete, fail: self._app_uninstaller.list_win32_async(
+                    on_complete=complete, on_error=fail
+                )
+            )
+        self._launch(
+            title,
+            self._apps_uninstall_buttons,
+            self._apps_progress,
+            self._apps_log,
+            starter,
+            self._apps_uninstall_list_done,
+            self._apps_uninstall_error,
+        )
+
+    def _apps_uninstall_list_done(
+        self, payload: tuple[list[UninstallEntry], list[str]]
+    ) -> None:
+        """Fill the program combo from the loaded entries."""
+        self._end_operation(self._apps_uninstall_buttons, self._apps_progress)
+        entries, errors = payload
+        for error in errors:
+            self._append_log(self._apps_log, error, error=True)
+        self._uninstall_entries = entries
+        names: list[str] = []
+        for entry in entries:
+            if entry.display_name not in names:
+                names.append(entry.display_name)
+        self._apps_uninstall_combo.configure(values=names)
+        if names:
+            self._apps_uninstall_combo.set(names[0])
+            self._append_log(self._apps_log, f"Programas cargados: {len(names)}.")
+        else:
+            self._append_log(self._apps_log, "No se encontraron programas.")
+
+    def _apps_find_entry(self, display_name: str) -> Optional[UninstallEntry]:
+        """Return the last entry whose display name matches exactly."""
+        found: Optional[UninstallEntry] = None
+        for entry in self._uninstall_entries:
+            if entry.display_name == display_name:
+                found = entry
+        return found
+
+    def _apps_uninstall_selected(self) -> None:
+        """Uninstall the program selected in the combo after confirmation."""
+        name = self._apps_uninstall_combo.get().strip()
+        if not name:
+            self._append_log(
+                self._apps_log, "Selecciona un programa para desinstalar.", error=True
+            )
+            return
+        entry = self._apps_find_entry(name)
+        if entry is None:
+            self._append_log(
+                self._apps_log, "El programa seleccionado no está cargado.", error=True
+            )
+            return
+        if not messagebox.askyesno("Desinstalar", f"¿Desinstalar {name}?"):
+            return
+        force_silent = self._apps_uninstall_silent.get() == 1
+        deep_clean = self._apps_uninstall_deep.get() == 1
+        self._launch(
+            f"Desinstalar {name}",
+            self._apps_uninstall_buttons,
+            self._apps_progress,
+            self._apps_log,
+            lambda complete, fail: self._app_uninstaller.uninstall_async(
+                entry,
+                force_silent=force_silent,
+                deep_clean=deep_clean,
+                on_complete=complete,
+                on_error=fail,
+            ),
+            lambda result: self._apps_uninstall_done(result, deep_clean),
+            self._apps_uninstall_error,
+        )
+
+    def _apps_uninstall_done(self, result: UninstallResult, deep_clean: bool) -> None:
+        """Log the uninstall outcome and surface residuals when present."""
+        self._end_operation(self._apps_uninstall_buttons, self._apps_progress)
+        audit("uninstall", f"name={result.entry.display_name} deep={int(deep_clean)}")
+        if result.success:
+            self._append_log(
+                self._apps_log,
+                f"Desinstalación de {result.entry.display_name} finalizada.",
+            )
+            self._uninstall_residuals = list(result.residuals)
+            if deep_clean and result.residuals:
+                self._append_log(
+                    self._apps_log, f"Residuales detectados: {len(result.residuals)}."
+                )
+                self._apps_uninstall_residuals_btn.configure(
+                    text=f"Eliminar residuales ({len(result.residuals)})"
+                )
+                self._apps_uninstall_residuals_btn.grid()
+            else:
+                self._apps_uninstall_residuals_btn.configure(text="Eliminar residuales")
+                self._apps_uninstall_residuals_btn.grid_remove()
+            return
+        self._append_log(
+            self._apps_log,
+            f"No se pudo desinstalar {result.entry.display_name}.",
+            error=True,
+        )
+        for line in self._format_command_result(result.result):
+            self._append_log(self._apps_log, line, error=True)
+        for error in result.errors:
+            self._append_log(self._apps_log, error, error=True)
+
+    def _apps_uninstall_error(self, error: Any) -> None:
+        """Log an uninstaller-operation error."""
+        self._end_operation(self._apps_uninstall_buttons, self._apps_progress)
+        self._log_error(self._apps_log, error)
+
+    def _apps_remove_residuals(self) -> None:
+        """Remove every pending residual sequentially in the background."""
+        if not self._uninstall_residuals:
+            self._append_log(self._apps_log, "No hay residuales pendientes.", error=True)
+            return
+        pending = list(self._uninstall_residuals)
+        self._uninstall_residuals = []
+        if not messagebox.askyesno(
+            "Eliminar residuales",
+            f"¿Eliminar {len(pending)} residuales de la aplicación?",
+        ):
+            self._uninstall_residuals = pending
+            return
+        self._begin_operation(self._apps_uninstall_buttons, self._apps_progress)
+        self._append_log(self._apps_log, f"Eliminando {len(pending)} residuales...")
+        self._apps_uninstall_residuals_btn.grid_remove()
+
+        def _next(index: int) -> None:
+            if index >= len(pending):
+                try:
+                    self.after(0, self._apps_residuals_done)
+                except TclError:
+                    pass
+                return
+            entry = pending[index]
+
+            def _done(ok: bool) -> None:
+                try:
+                    self.after(
+                        0,
+                        self._append_log,
+                        self._apps_log,
+                        f"{'OK' if ok else 'FAIL'}: {entry.description}",
+                        not ok,
+                    )
+                except TclError:
+                    pass
+                _next(index + 1)
+
+            def _fail(error: Any) -> None:
+                try:
+                    self.after(
+                        0,
+                        self._append_log,
+                        self._apps_log,
+                        f"Error al eliminar residual: {error}",
+                        True,
+                    )
+                except TclError:
+                    pass
+                _next(index + 1)
+
+            try:
+                self._app_uninstaller.remove_residual_async(
+                    entry, on_complete=_done, on_error=_fail
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                _fail(exc)
+
+        _next(0)
+
+    def _apps_residuals_done(self) -> None:
+        """Re-enable the uninstaller controls after the residual pass."""
+        self._end_operation(self._apps_uninstall_buttons, self._apps_progress)
+        audit("uninstall_residuals", "terminado")
+        self._append_log(self._apps_log, "Eliminación de residuales finalizada.")
 
     def _apps_search(self) -> None:
         """Search winget sources for a package (sync core, run in a thread)."""
@@ -1652,16 +2341,23 @@ class DanTechStudioApp(ctk.CTk):
 
         run_row = ctk.CTkFrame(frame, fg_color="transparent")
         run_row.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 4))
-        run_row.grid_columnconfigure(1, weight=1)
+        run_row.grid_columnconfigure(2, weight=1)
 
         self._recovery_run_button = ctk.CTkButton(
             run_row, text="Escanear y Recuperar", command=self._recovery_run
         )
-        self._recovery_run_button.grid(row=0, column=0, padx=(0, 12))
+        self._recovery_run_button.grid(row=0, column=0, padx=(0, 8))
+
+        reset_filters_btn = ctk.CTkButton(
+            run_row,
+            text="Restablecer Filtros",
+            command=self._recovery_reset_filters,
+        )
+        reset_filters_btn.grid(row=0, column=1, padx=(0, 8))
 
         self._recovery_progress = ctk.CTkProgressBar(run_row, mode="indeterminate")
         self._recovery_progress.set(0)
-        self._recovery_progress.grid(row=0, column=1, sticky="ew")
+        self._recovery_progress.grid(row=0, column=2, sticky="ew")
 
         self._recovery_summary = ctk.CTkLabel(
             frame,
@@ -1681,6 +2377,17 @@ class DanTechStudioApp(ctk.CTk):
             return
         self._recovery_dest_path = selected
         self._recovery_dest_label.configure(text=f"Destino: {selected}")
+
+    def _recovery_reset_filters(self) -> None:
+        """Restore recovery defaults: Documentos ON, others OFF, no destination."""
+        for group, checkbox in self._recovery_filters.items():
+            if group == "Documentos":
+                checkbox.select()
+            else:
+                checkbox.deselect()
+        self._recovery_dest_path = None
+        self._recovery_dest_label.configure(text="Destino: no seleccionado")
+        self._append_log(self._recovery_log, "Filtros de recuperación restablecidos.")
 
     def _recovery_run(self) -> None:
         """Start a light recovery job from the selected drive and filters."""
@@ -1792,10 +2499,35 @@ class DanTechStudioApp(ctk.CTk):
         )
         self._net_ping_summary.grid(row=4, column=0, sticky="w", padx=16, pady=(0, 4))
 
+        config_row = ctk.CTkFrame(frame, fg_color="transparent")
+        config_row.grid(row=5, column=0, sticky="ew", padx=16, pady=(4, 4))
+        config_row.grid_columnconfigure(4, weight=1)
+
+        hosts_label = ctk.CTkLabel(config_row, text="Hosts:", font=("Segoe UI", 12))
+        hosts_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self._net_hosts_entry = ctk.CTkEntry(
+            config_row, placeholder_text="8.8.8.8, 1.1.1.1", width=220
+        )
+        self._net_hosts_entry.insert(0, "8.8.8.8, 1.1.1.1")
+        self._net_hosts_entry.grid(row=0, column=1, sticky="w", padx=(0, 16))
+
+        count_label = ctk.CTkLabel(config_row, text="Pings:", font=("Segoe UI", 12))
+        count_label.grid(row=0, column=2, sticky="w", padx=(0, 8))
+
+        self._net_count_entry = ctk.CTkEntry(config_row, width=60)
+        self._net_count_entry.insert(0, "4")
+        self._net_count_entry.grid(row=0, column=3, sticky="w", padx=(0, 16))
+
+        net_reset_btn = ctk.CTkButton(
+            config_row, text="Restablecer", command=self._network_reset_config
+        )
+        net_reset_btn.grid(row=0, column=4, sticky="e")
+
         reset_header = ctk.CTkLabel(
             frame, text="Reseteo profundo de red", font=("Segoe UI", 14, "bold")
         )
-        reset_header.grid(row=5, column=0, sticky="w", padx=16, pady=(8, 4))
+        reset_header.grid(row=6, column=0, sticky="w", padx=16, pady=(8, 4))
 
         reset_warning = ctk.CTkLabel(
             frame,
@@ -1804,10 +2536,10 @@ class DanTechStudioApp(ctk.CTk):
             font=("Segoe UI", 12),
             text_color=_COLOR_WARN,
         )
-        reset_warning.grid(row=6, column=0, sticky="w", padx=16, pady=(0, 4))
+        reset_warning.grid(row=7, column=0, sticky="w", padx=16, pady=(0, 4))
 
         reset_row = ctk.CTkFrame(frame, fg_color="transparent")
-        reset_row.grid(row=7, column=0, sticky="ew", padx=16, pady=(4, 4))
+        reset_row.grid(row=8, column=0, sticky="ew", padx=16, pady=(4, 4))
         reset_row.grid_columnconfigure(1, weight=1)
 
         self._net_reset_button = ctk.CTkButton(
@@ -1826,25 +2558,44 @@ class DanTechStudioApp(ctk.CTk):
         self._net_reset_summary = ctk.CTkLabel(
             frame, text="", font=("Segoe UI", 12, "bold"), text_color=_COLOR_OK
         )
-        self._net_reset_summary.grid(row=8, column=0, sticky="w", padx=16, pady=(0, 4))
+        self._net_reset_summary.grid(row=9, column=0, sticky="w", padx=16, pady=(0, 4))
 
-        self._net_log = self._section_log(frame, row=10)
+        self._net_log = self._section_log(frame, row=11)
         return frame
 
     def _network_ping(self) -> None:
-        """Ping the two public DNS hosts in the background."""
-        hosts = ["8.8.8.8", "1.1.1.1"]
+        """Ping the configured hosts in the background."""
+        hosts = [
+            part.strip()
+            for part in self._net_hosts_entry.get().replace(";", ",").split(",")
+            if part.strip()
+        ]
+        try:
+            count = int(self._net_count_entry.get().strip() or "4")
+        except ValueError:
+            count = 4
+        if not hosts:
+            self._append_log(self._net_log, "Ingresa al menos un host.", error=True)
+            return
         self._launch(
             "Diagnóstico de ping",
             [self._net_ping_button],
             self._net_ping_progress,
             self._net_log,
-            lambda complete, fail: self._network_diagnostic.ping_hosts_async(
-                hosts, on_complete=complete, on_error=fail
+            lambda complete, fail: self._run_sync_in_thread(
+                self._network_diagnostic.ping_hosts, complete, fail, hosts, count
             ),
             self._network_ping_done,
             self._network_error,
         )
+
+    def _network_reset_config(self) -> None:
+        """Restore the ping defaults: 8.8.8.8/1.1.1.1 and count 4."""
+        self._net_hosts_entry.delete(0, "end")
+        self._net_hosts_entry.insert(0, "8.8.8.8, 1.1.1.1")
+        self._net_count_entry.delete(0, "end")
+        self._net_count_entry.insert(0, "4")
+        self._append_log(self._net_log, "Configuración de red restablecida.")
 
     def _network_ping_done(self, results: list[PingResult]) -> None:
         """Log each ping result and the connectivity summary."""
@@ -1866,7 +2617,7 @@ class DanTechStudioApp(ctk.CTk):
         self._net_ping_summary.configure(
             text=summary, text_color=_COLOR_OK if all_ok else _COLOR_WARN
         )
-        audit("ping", "hosts=8.8.8.8,1.1.1.1")
+        audit("ping", f"hosts={','.join(result.host for result in results)}")
 
     def _network_reset(self) -> None:
         """Run the deep network-stack reset in the background."""
@@ -1930,10 +2681,19 @@ class DanTechStudioApp(ctk.CTk):
         )
         self._startup_boot_label.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
 
+        startup_row = ctk.CTkFrame(frame, fg_color="transparent")
+        startup_row.grid(row=2, column=0, sticky="w", padx=16, pady=(0, 8))
+        startup_row.grid_columnconfigure(1, weight=1)
+
         self._startup_refresh_button = ctk.CTkButton(
-            frame, text="Actualizar lista", command=self._startup_refresh
+            startup_row, text="Actualizar lista", command=self._startup_refresh
         )
-        self._startup_refresh_button.grid(row=2, column=0, sticky="w", padx=16, pady=(0, 8))
+        self._startup_refresh_button.grid(row=0, column=0, padx=(0, 8))
+
+        self._startup_reset_button = ctk.CTkButton(
+            startup_row, text="Restablecer", command=self._startup_reset
+        )
+        self._startup_reset_button.grid(row=0, column=1)
 
         self._startup_list = ctk.CTkScrollableFrame(frame)
         self._startup_list.grid(row=3, column=0, sticky="nsew", padx=16, pady=(0, 8))
@@ -1967,6 +2727,10 @@ class DanTechStudioApp(ctk.CTk):
             self._startup_list_done,
             self._startup_list_error,
         )
+
+    def _startup_reset(self) -> None:
+        """Restore the startup view: reload the entries list."""
+        self._startup_refresh()
 
     def _startup_list_done(
         self, payload: tuple[list[StartupEntry], list[str]]
