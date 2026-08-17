@@ -20,5 +20,10 @@ Desktop.ini
 .env*
 .env.local
 
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
 # Tooling metadata (gentle-ai skill registry, auto-generated)
 .atl/
