@@ -1,8 +1,9 @@
 """main_window.py - DanTechStudioApp: main GUI window of the DanTech Studio suite.
 
 A dark-mode desktop suite for Windows built on CustomTkinter. It provides a
-sidebar navigation with six views (Dashboard, Memoria, Reparación, Seguridad,
-Apps, Scripts) that expose the functionality of the ``core`` modules.
+sidebar navigation with nine views (Dashboard, Memoria, Reparación, Seguridad,
+Apps, Scripts, Recuperación, Red y conectividad, Programas de inicio) that
+expose the functionality of the ``core`` modules.
 
 Execution contract:
     - This module NEVER runs system commands directly: every long-running
@@ -29,6 +30,8 @@ import customtkinter as ctk
 from customtkinter import filedialog
 from tkinter import TclError
 
+from core.audit import audit
+from core.data_recovery import DataRecovery, EXTENSION_GROUPS, RecoveryJobResult
 from core.disk_analyzer import DiskAnalyzer, DiskHealth, DiskUsage
 from core.installer import Installer, WingetResult
 from core.malware_cleaner import MalwareCleaner, ScanReport
@@ -38,7 +41,9 @@ from core.memory_optimizer import (
     MemoryOptimizer,
     RamReport,
 )
+from core.network_diagnostic import NetworkDiagnostic, NetworkResetResult, PingResult
 from core.report_generator import ActionRecord, ReportGenerator
+from core.startup_manager import BootInfo, StartupActionResult, StartupEntry, StartupManager
 from core.system_repair import RepairReport, SystemRepair
 from utils import process_runner
 from utils.process_runner import CommandResult
@@ -47,6 +52,14 @@ try:
     import psutil  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover - telemetry degrades gracefully
     psutil = None  # type: ignore[assignment]
+
+try:
+    import qrcode  # type: ignore[import-untyped]
+    from PIL import Image, ImageTk  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover - QR codes degrade gracefully
+    qrcode = None  # type: ignore[assignment]
+    Image = None  # type: ignore[assignment]
+    ImageTk = None  # type: ignore[assignment]
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -62,6 +75,9 @@ _NAV_ITEMS: tuple[str, ...] = (
     "Seguridad",
     "Apps",
     "Scripts",
+    "Recuperación",
+    "Red & Conectividad",
+    "Programas de Inicio",
 )
 
 #: Highlight colors for the active navigation button.
@@ -90,7 +106,7 @@ class DanTechStudioApp(ctk.CTk):
     """
 
     def __init__(self, script_path: Optional[str] = None) -> None:
-        """Build the window, the sidebar and the six views, then start telemetry.
+        """Build the window, the sidebar and the nine views, then start telemetry.
 
         Args:
             script_path: Optional absolute path of the PowerShell maintenance
@@ -124,11 +140,17 @@ class DanTechStudioApp(ctk.CTk):
         self._installer = Installer()
         self._report_generator = ReportGenerator()
         self._disk_analyzer = DiskAnalyzer()
+        self._recovery_manager = DataRecovery()
+        self._network_diagnostic = NetworkDiagnostic()
+        self._startup_manager = StartupManager()
 
         self._active_buttons: list[Any] = []
         self._active_progress: Optional[Any] = None
         self._views: dict[str, ctk.CTkFrame] = {}
         self._nav_buttons: dict[str, ctk.CTkButton] = {}
+        self._startup_entries: list[StartupEntry] = []
+        self._qr_window: Optional[ctk.CTkToplevel] = None
+        self._qr_images: list[Any] = []
 
         self._telemetry_active: bool = False
         self._telemetry_thread: Optional[threading.Thread] = None
@@ -394,21 +416,21 @@ class DanTechStudioApp(ctk.CTk):
                 self.sidebar,
                 text=name,
                 anchor="w",
-                height=36,
+                height=34,
                 corner_radius=6,
                 fg_color=_NAV_INACTIVE_FG,
                 hover_color="#2e2e2e",
                 command=lambda nav_name=name: self._show_view(nav_name),
             )
-            button.grid(row=2 + index, column=0, sticky="ew", padx=12, pady=3)
+            button.grid(row=2 + index, column=0, sticky="ew", padx=12, pady=2)
             self._nav_buttons[name] = button
 
-        self.sidebar.grid_rowconfigure(8, weight=1)
+        self.sidebar.grid_rowconfigure(11, weight=1)
 
         self._admin_status_label = ctk.CTkLabel(
             self.sidebar, text="Administrador: --", font=("Segoe UI", 12)
         )
-        self._admin_status_label.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 4))
+        self._admin_status_label.grid(row=12, column=0, sticky="ew", padx=16, pady=(0, 4))
 
         self._admin_button = ctk.CTkButton(
             self.sidebar,
@@ -416,7 +438,7 @@ class DanTechStudioApp(ctk.CTk):
             height=32,
             command=self._relaunch_as_admin,
         )
-        self._admin_button.grid(row=10, column=0, sticky="ew", padx=12, pady=(0, 16))
+        self._admin_button.grid(row=13, column=0, sticky="ew", padx=12, pady=(0, 16))
 
     def _refresh_admin_status(self) -> None:
         """Update the sidebar admin label and show/hide the elevation button."""
@@ -471,6 +493,9 @@ class DanTechStudioApp(ctk.CTk):
         self._views["Seguridad"] = self._build_security()
         self._views["Apps"] = self._build_apps()
         self._views["Scripts"] = self._build_scripts()
+        self._views["Recuperación"] = self._build_recovery()
+        self._views["Red & Conectividad"] = self._build_network()
+        self._views["Programas de Inicio"] = self._build_startup()
 
     def _show_view(self, name: str) -> None:
         """Display one view frame and highlight its navigation button."""
@@ -540,7 +565,7 @@ class DanTechStudioApp(ctk.CTk):
 
         actions_row = ctk.CTkFrame(frame, fg_color="transparent")
         actions_row.grid(row=6, column=0, sticky="ew", padx=16, pady=(8, 4))
-        actions_row.grid_columnconfigure(2, weight=1)
+        actions_row.grid_columnconfigure(3, weight=1)
 
         self._dash_export_button = ctk.CTkButton(
             actions_row,
@@ -557,6 +582,13 @@ class DanTechStudioApp(ctk.CTk):
             command=self._dashboard_express_maintenance,
         )
         self._dash_express_button.grid(row=0, column=1)
+
+        self._dash_qr_button = ctk.CTkButton(
+            actions_row,
+            text="Mostrar QR de Contacto",
+            command=self._dashboard_show_qr,
+        )
+        self._dash_qr_button.grid(row=0, column=2, padx=(8, 0))
 
         self._dash_express_progress = ctk.CTkProgressBar(frame, mode="determinate")
         self._dash_express_progress.set(0)
@@ -616,6 +648,7 @@ class DanTechStudioApp(ctk.CTk):
         if not target:
             return
         kind = "html" if Path(target).suffix.lower() == ".html" else "pdf"
+        audit("report_export", f"formato={kind}")
         actions = self._session_actions()
         self._launch(
             "Exportar informe",
@@ -733,6 +766,7 @@ class DanTechStudioApp(ctk.CTk):
 
     def _dashboard_express_done(self, total_bytes: float, warnings: list[str]) -> None:
         """Stop the express indicators and show the result banner."""
+        audit("express_maintenance", "terminado")
         self._end_operation([self._dash_express_button], self._dash_express_progress)
         self._dash_express_status.configure(text="Mantenimiento Express disponible.")
         freed_text = self._format_size(total_bytes)
@@ -756,6 +790,71 @@ class DanTechStudioApp(ctk.CTk):
     def _hide_dashboard_banner(self) -> None:
         """Hide the result banner (reset before the next express run)."""
         self._dash_banner.grid_remove()
+
+    def _dashboard_show_qr(self) -> None:
+        """Open a child Toplevel showing the two contact QR codes.
+
+        qrcode/Pillow are optional: when they are missing the action degrades
+        to an error log line instead of crashing.
+        """
+        if qrcode is None or Image is None:
+            audit("qr", "Mostrar QR de contacto")
+            self._append_log(
+                self._dash_log,
+                "No se pudo generar el QR: faltan las librerías qrcode o Pillow.",
+                error=True,
+            )
+            return
+        if self._qr_window is not None and self._qr_window.winfo_exists():
+            self._qr_window.lift()
+            self._qr_window.focus_force()
+            return
+
+        window = ctk.CTkToplevel(self)
+        window.title("QR de Contacto")
+        qr_size = 180 if self.winfo_screenwidth() >= 1280 else 160
+        window.geometry("480x360")
+        window.resizable(False, False)
+        window.transient(self)
+        window.after(50, window.lift)
+
+        data_pairs: tuple[tuple[str, str], ...] = (
+            ("WhatsApp", "https://wa.me/541131797343"),
+            ("Sitio Web", "https://dantech-landing.vercel.app"),
+        )
+
+        container = ctk.CTkFrame(window, fg_color="transparent")
+        container.grid(row=0, column=0, padx=16, pady=(20, 8))
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_columnconfigure(1, weight=1)
+
+        for column, (label_text, data) in enumerate(data_pairs):
+            cell = ctk.CTkFrame(container, fg_color="transparent")
+            cell.grid(row=0, column=column, padx=16)
+            try:
+                image = qrcode.make(data)
+            except Exception as exc:
+                audit("qr", f"Fallo al generar QR {label_text}: {exc}")
+                self._append_log(
+                    self._dash_log,
+                    f"No se pudo generar el QR de {label_text}: {exc}",
+                    error=True,
+                )
+                return
+            photo = ctk.CTkImage(
+                light_image=image, dark_image=image, size=(qr_size, qr_size)
+            )
+            self._qr_images.append(photo)
+            image_label = ctk.CTkLabel(cell, image=photo, text="")
+            image_label.grid(row=0, column=0, sticky="ew")
+            caption = ctk.CTkLabel(cell, text=label_text, font=("Segoe UI", 13, "bold"))
+            caption.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+        close_button = ctk.CTkButton(window, text="Cerrar", command=window.destroy)
+        close_button.grid(row=1, column=0, pady=(4, 16))
+
+        self._qr_window = window
+        audit("qr", "Mostrar QR de contacto")
 
     def _start_disk_health_fetch(self) -> None:
         """Fetch SMART health and C: usage once, asynchronously."""
@@ -1004,6 +1103,7 @@ class DanTechStudioApp(ctk.CTk):
 
     def _memory_all_done(self, report: CombinedReport) -> None:
         """Log the outcome of the combined optimization pass."""
+        audit("memory_optimize", "terminado")
         self._end_operation(self._memory_buttons, self._memory_progress)
         self._append_log(self._memory_log, "Optimización completa finalizada.")
         for line in self._format_combined_report(report):
@@ -1125,6 +1225,7 @@ class DanTechStudioApp(ctk.CTk):
 
     def _repair_restore_done(self, result: CommandResult) -> None:
         """Log the restore-point outcome (System Restore can be disabled)."""
+        audit("restore_point", "resultado")
         self._end_operation(self._repair_buttons, self._repair_progress)
         if result.success:
             self._append_log(self._repair_log, "Punto de restauración creado correctamente.")
@@ -1483,6 +1584,505 @@ class DanTechStudioApp(ctk.CTk):
         """Log a maintenance-script error."""
         self._end_operation(self._scripts_buttons, self._scripts_progress)
         self._log_error(self._scripts_log, error)
+
+    # ------------------------------------------------------------ recuperación
+
+    def _build_recovery(self) -> ctk.CTkFrame:
+        """Build the file-recovery view (light mode by extension)."""
+        frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(8, weight=1)
+
+        title = self._section_title(frame, "Recuperación de archivos")
+        title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
+
+        description = ctk.CTkLabel(
+            frame,
+            text="Busca archivos por tipo en una unidad y los copia a la carpeta "
+            "de destino manteniendo la estructura de carpetas.",
+            font=("Segoe UI", 12),
+            text_color="#8a8a8a",
+        )
+        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+
+        try:
+            drives = self._recovery_manager.get_drives() or ["C:\\"]
+        except Exception:
+            drives = ["C:\\"]
+
+        source_row = ctk.CTkFrame(frame, fg_color="transparent")
+        source_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(8, 4))
+        source_row.grid_columnconfigure(1, weight=1)
+
+        source_label = ctk.CTkLabel(source_row, text="Unidad de origen:")
+        source_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self._recovery_drive_combo = ctk.CTkComboBox(source_row, values=drives, width=140)
+        self._recovery_drive_combo.set(drives[0] if drives else "C:\\")
+        self._recovery_drive_combo.grid(row=0, column=1, sticky="w", padx=(0, 16))
+
+        dest_button = ctk.CTkButton(
+            source_row,
+            text="Seleccionar destino...",
+            command=self._recovery_select_destination,
+        )
+        dest_button.grid(row=0, column=2, sticky="e")
+
+        self._recovery_dest_path: Optional[str] = None
+        self._recovery_dest_label = ctk.CTkLabel(
+            frame,
+            text="Destino: no seleccionado",
+            font=("Segoe UI", 12),
+            text_color="#8a8a8a",
+        )
+        self._recovery_dest_label.grid(row=3, column=0, sticky="w", padx=16, pady=(0, 4))
+
+        filters_row = ctk.CTkFrame(frame, fg_color="transparent")
+        filters_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 4))
+
+        filters_label = ctk.CTkLabel(filters_row, text="Tipos de archivo:")
+        filters_label.grid(row=0, column=0, sticky="w", padx=(0, 12))
+
+        self._recovery_filters: dict[str, ctk.CTkCheckBox] = {}
+        for column, group in enumerate(EXTENSION_GROUPS, start=1):
+            checkbox = ctk.CTkCheckBox(filters_row, text=group)
+            checkbox.grid(row=0, column=column, padx=(0, 12))
+            self._recovery_filters[group] = checkbox
+        self._recovery_filters["Documentos"].select()
+
+        run_row = ctk.CTkFrame(frame, fg_color="transparent")
+        run_row.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 4))
+        run_row.grid_columnconfigure(1, weight=1)
+
+        self._recovery_run_button = ctk.CTkButton(
+            run_row, text="Escanear y Recuperar", command=self._recovery_run
+        )
+        self._recovery_run_button.grid(row=0, column=0, padx=(0, 12))
+
+        self._recovery_progress = ctk.CTkProgressBar(run_row, mode="indeterminate")
+        self._recovery_progress.set(0)
+        self._recovery_progress.grid(row=0, column=1, sticky="ew")
+
+        self._recovery_summary = ctk.CTkLabel(
+            frame,
+            text="",
+            font=("Segoe UI", 12, "bold"),
+            text_color=_COLOR_OK,
+        )
+        self._recovery_summary.grid(row=6, column=0, sticky="w", padx=16, pady=(0, 4))
+
+        self._recovery_log = self._section_log(frame, row=8)
+        return frame
+
+    def _recovery_select_destination(self) -> None:
+        """Pick the recovery destination folder through a directory dialog."""
+        selected = filedialog.askdirectory(title="Seleccionar carpeta de destino")
+        if not selected:
+            return
+        self._recovery_dest_path = selected
+        self._recovery_dest_label.configure(text=f"Destino: {selected}")
+
+    def _recovery_run(self) -> None:
+        """Start a light recovery job from the selected drive and filters."""
+        source_text = self._recovery_drive_combo.get().strip()
+        if not source_text:
+            self._append_log(self._recovery_log, "Selecciona una unidad de origen.", error=True)
+            return
+        if not self._recovery_dest_path:
+            self._append_log(
+                self._recovery_log, "Selecciona una carpeta de destino.", error=True
+            )
+            return
+        extensions: list[str] = []
+        for group, checkbox in self._recovery_filters.items():
+            if checkbox.get() == 1:
+                extensions.extend(EXTENSION_GROUPS[group])
+        if not extensions:
+            self._append_log(
+                self._recovery_log, "Selecciona al menos un tipo de archivo.", error=True
+            )
+            return
+        source = Path(source_text)
+        destination = Path(self._recovery_dest_path)
+        self._launch(
+            "Escanear y recuperar archivos",
+            [self._recovery_run_button],
+            self._recovery_progress,
+            self._recovery_log,
+            lambda complete, fail: self._recovery_manager.recover_async(
+                source,
+                destination,
+                extensions,
+                mode="light",
+                on_complete=complete,
+                on_error=fail,
+            ),
+            self._recovery_done,
+            self._recovery_error,
+        )
+
+    def _recovery_done(self, result: RecoveryJobResult) -> None:
+        """Log the recovery outcome and show the summary banner."""
+        self._end_operation([self._recovery_run_button], self._recovery_progress)
+        summary = (
+            f"Recuperación completada: {result.files_recovered} archivos, "
+            f"{self._format_size(result.bytes_recovered)}"
+        )
+        self._append_log(self._recovery_log, summary)
+        self._recovery_summary.configure(text=summary, text_color=_COLOR_OK)
+        if result.errors:
+            for error in result.errors[:5]:
+                self._append_log(self._recovery_log, f"  - {error}", error=True)
+            if len(result.errors) > 5:
+                self._append_log(
+                    self._recovery_log,
+                    f"  ... y {len(result.errors) - 5} avisos más.",
+                    error=True,
+                )
+        audit(
+            "recovery",
+            f"origen={result.source} destino={result.destination} "
+            f"archivos={result.files_recovered}",
+        )
+
+    def _recovery_error(self, error: Any) -> None:
+        """Log a recovery-job error."""
+        self._end_operation(self._active_buttons, self._active_progress)
+        self._log_error(self._recovery_log, error)
+
+    # ------------------------------------------------------------ red & conexión
+
+    def _build_network(self) -> ctk.CTkFrame:
+        """Build the network diagnostics and reset view."""
+        frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(10, weight=1)
+
+        title = self._section_title(frame, "Red y conectividad")
+        title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
+
+        description = ctk.CTkLabel(
+            frame,
+            text="Diagnostica la conexión y resetea la pila de red de Windows.",
+            font=("Segoe UI", 12),
+            text_color="#8a8a8a",
+        )
+        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+
+        diag_header = ctk.CTkLabel(
+            frame, text="Diagnóstico de conectividad", font=("Segoe UI", 14, "bold")
+        )
+        diag_header.grid(row=2, column=0, sticky="w", padx=16, pady=(8, 4))
+
+        diag_row = ctk.CTkFrame(frame, fg_color="transparent")
+        diag_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(4, 4))
+        diag_row.grid_columnconfigure(1, weight=1)
+
+        self._net_ping_button = ctk.CTkButton(
+            diag_row, text="Diagnosticar Ping", command=self._network_ping
+        )
+        self._net_ping_button.grid(row=0, column=0, padx=(0, 12))
+
+        self._net_ping_progress = ctk.CTkProgressBar(diag_row, mode="indeterminate")
+        self._net_ping_progress.set(0)
+        self._net_ping_progress.grid(row=0, column=1, sticky="ew")
+
+        self._net_ping_summary = ctk.CTkLabel(
+            frame, text="", font=("Segoe UI", 12, "bold"), text_color=_COLOR_OK
+        )
+        self._net_ping_summary.grid(row=4, column=0, sticky="w", padx=16, pady=(0, 4))
+
+        reset_header = ctk.CTkLabel(
+            frame, text="Reseteo profundo de red", font=("Segoe UI", 14, "bold")
+        )
+        reset_header.grid(row=5, column=0, sticky="w", padx=16, pady=(8, 4))
+
+        reset_warning = ctk.CTkLabel(
+            frame,
+            text="Puede requerir permisos de administrador y cortar la red "
+            "momentáneamente.",
+            font=("Segoe UI", 12),
+            text_color=_COLOR_WARN,
+        )
+        reset_warning.grid(row=6, column=0, sticky="w", padx=16, pady=(0, 4))
+
+        reset_row = ctk.CTkFrame(frame, fg_color="transparent")
+        reset_row.grid(row=7, column=0, sticky="ew", padx=16, pady=(4, 4))
+        reset_row.grid_columnconfigure(1, weight=1)
+
+        self._net_reset_button = ctk.CTkButton(
+            reset_row,
+            text="Reseteo Profundo de Red",
+            fg_color=_COLOR_WARN,
+            hover_color="#d68910",
+            command=self._network_reset,
+        )
+        self._net_reset_button.grid(row=0, column=0, padx=(0, 12))
+
+        self._net_reset_progress = ctk.CTkProgressBar(reset_row, mode="indeterminate")
+        self._net_reset_progress.set(0)
+        self._net_reset_progress.grid(row=0, column=1, sticky="ew")
+
+        self._net_reset_summary = ctk.CTkLabel(
+            frame, text="", font=("Segoe UI", 12, "bold"), text_color=_COLOR_OK
+        )
+        self._net_reset_summary.grid(row=8, column=0, sticky="w", padx=16, pady=(0, 4))
+
+        self._net_log = self._section_log(frame, row=10)
+        return frame
+
+    def _network_ping(self) -> None:
+        """Ping the two public DNS hosts in the background."""
+        hosts = ["8.8.8.8", "1.1.1.1"]
+        self._launch(
+            "Diagnóstico de ping",
+            [self._net_ping_button],
+            self._net_ping_progress,
+            self._net_log,
+            lambda complete, fail: self._network_diagnostic.ping_hosts_async(
+                hosts, on_complete=complete, on_error=fail
+            ),
+            self._network_ping_done,
+            self._network_error,
+        )
+
+    def _network_ping_done(self, results: list[PingResult]) -> None:
+        """Log each ping result and the connectivity summary."""
+        self._end_operation([self._net_ping_button], self._net_ping_progress)
+        parts: list[str] = []
+        all_ok = True
+        for result in results:
+            all_ok = all_ok and result.loss_percent == 0.0
+            self._append_log(
+                self._net_log,
+                f"Ping {result.host}: {result.received}/{result.sent} "
+                f"perdida={result.loss_percent}% promedio={result.avg_ms}ms",
+            )
+            if result.errors:
+                for error in result.errors[:2]:
+                    self._append_log(self._net_log, f"  - {error}", error=True)
+            parts.append(f"{result.host}: {result.loss_percent}% pérdida")
+        summary = f"Conectividad: {'OK' if all_ok else 'con pérdida'} - " + " | ".join(parts)
+        self._net_ping_summary.configure(
+            text=summary, text_color=_COLOR_OK if all_ok else _COLOR_WARN
+        )
+        audit("ping", "hosts=8.8.8.8,1.1.1.1")
+
+    def _network_reset(self) -> None:
+        """Run the deep network-stack reset in the background."""
+        self._append_log(
+            self._net_log,
+            "Puede requerir permisos de administrador y cortar la red momentáneamente.",
+        )
+        self._launch(
+            "Reseteo profundo de red",
+            [self._net_reset_button],
+            self._net_reset_progress,
+            self._net_log,
+            lambda complete, fail: self._network_diagnostic.reset_network_stack_async(
+                on_complete=complete, on_error=fail
+            ),
+            self._network_reset_done,
+            self._network_error,
+        )
+
+    def _network_reset_done(self, result: NetworkResetResult) -> None:
+        """Log every reset step and the overall result."""
+        self._end_operation([self._net_reset_button], self._net_reset_progress)
+        ok_steps = 0
+        total = len(result.steps)
+        for step in result.steps:
+            if step.result.success:
+                ok_steps += 1
+            self._append_log(
+                self._net_log,
+                f"{'OK' if step.result.success else 'FAIL'}: {step.label}",
+            )
+        summary = f"Reseteo completado: {ok_steps}/{total} pasos correctos."
+        self._append_log(self._net_log, summary)
+        self._net_reset_summary.configure(
+            text=summary,
+            text_color=_COLOR_OK if result.success else _COLOR_BAD,
+        )
+        audit("network_reset", f"steps={ok_steps}/{total}")
+
+    def _network_error(self, error: Any) -> None:
+        """Log a network-operation error."""
+        self._end_operation(self._active_buttons, self._active_progress)
+        self._log_error(self._net_log, error)
+
+    # ----------------------------------------------------------- programas inicio
+
+    def _build_startup(self) -> ctk.CTkFrame:
+        """Build the startup programs manager view."""
+        frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(3, weight=1)
+
+        title = self._section_title(frame, "Programas de inicio")
+        title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
+
+        self._startup_boot_label = ctk.CTkLabel(
+            frame,
+            text="Consultando último inicio...",
+            font=("Segoe UI", 12),
+            text_color="#8a8a8a",
+        )
+        self._startup_boot_label.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
+
+        self._startup_refresh_button = ctk.CTkButton(
+            frame, text="Actualizar lista", command=self._startup_refresh
+        )
+        self._startup_refresh_button.grid(row=2, column=0, sticky="w", padx=16, pady=(0, 8))
+
+        self._startup_list = ctk.CTkScrollableFrame(frame)
+        self._startup_list.grid(row=3, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        self._startup_list.grid_columnconfigure(0, weight=1)
+
+        self._startup_log = self._section_log(frame, row=5)
+
+        def _complete(info: BootInfo) -> None:
+            try:
+                self.after(0, self._startup_boot_done, info)
+            except (TclError, RuntimeError):
+                pass
+
+        try:
+            self._startup_manager.get_boot_info_async(_complete, None)
+        except Exception:
+            pass
+        self._startup_reload_list()
+        return frame
+
+    def _startup_refresh(self) -> None:
+        """Reload the startup entries list in the background."""
+        self._launch(
+            "Cargar lista de programas de inicio",
+            [self._startup_refresh_button],
+            None,
+            self._startup_log,
+            lambda complete, fail: self._startup_manager.list_entries_async(
+                on_complete=complete, on_error=fail
+            ),
+            self._startup_list_done,
+            self._startup_list_error,
+        )
+
+    def _startup_list_done(
+        self, payload: tuple[list[StartupEntry], list[str]]
+    ) -> None:
+        """Store the loaded entries and render the rows."""
+        self._end_operation([self._startup_refresh_button], None)
+        self._startup_store_entries(payload)
+
+    def _startup_store_entries(
+        self, payload: tuple[list[StartupEntry], list[str]]
+    ) -> None:
+        """Persist the entries, log read errors and re-render the list."""
+        entries, errors = payload
+        self._startup_entries = entries
+        for error in errors:
+            self._append_log(self._startup_log, error, error=True)
+        self._render_startup_entries()
+
+    def _startup_list_error(self, error: Any) -> None:
+        """Log a startup-list load error."""
+        self._end_operation(self._active_buttons, self._active_progress)
+        self._log_error(self._startup_log, error)
+
+    def _render_startup_entries(self) -> None:
+        """Rebuild the scrollable rows from the current entry snapshot."""
+        for child in self._startup_list.winfo_children():
+            child.destroy()
+        if not self._startup_entries:
+            empty = ctk.CTkLabel(
+                self._startup_list,
+                text="No se encontraron programas de inicio.",
+                text_color="#8a8a8a",
+            )
+            empty.grid(row=0, column=0, sticky="w", padx=8, pady=8)
+            return
+        for index, entry in enumerate(self._startup_entries):
+            row = ctk.CTkFrame(self._startup_list, fg_color="transparent")
+            row.grid(row=index, column=0, sticky="ew", padx=4, pady=3)
+            row.grid_columnconfigure(0, weight=1)
+
+            command = entry.command or "(sin comando)"
+            if len(command) > 60:
+                command = command[:60] + "..."
+            info_text = f"{entry.name}  [{entry.hive}]\n{command}"
+            info = ctk.CTkLabel(
+                row,
+                text=info_text,
+                font=("Segoe UI", 12),
+                justify="left",
+                anchor="w",
+            )
+            info.grid(row=0, column=0, sticky="w", padx=(6, 8), pady=2)
+
+            action = "Deshabilitar" if entry.enabled else "Habilitar"
+            toggle = ctk.CTkButton(
+                row,
+                text=action,
+                width=110,
+                height=28,
+                command=lambda e=entry: self._startup_toggle(e),
+            )
+            toggle.grid(row=0, column=1, padx=6, pady=2)
+
+    def _startup_toggle(self, entry: StartupEntry) -> None:
+        """Enable or disable one startup entry in the background."""
+        target = not entry.enabled
+        action = "Habilitar" if target else "Deshabilitar"
+        self._launch(
+            f"{action} {entry.name}",
+            [self._startup_refresh_button],
+            None,
+            self._startup_log,
+            lambda complete, fail: self._startup_manager.set_enabled_async(
+                entry, target, on_complete=complete, on_error=fail
+            ),
+            self._startup_toggle_done,
+            self._startup_list_error,
+        )
+
+    def _startup_toggle_done(self, result: StartupActionResult) -> None:
+        """Log the toggle result and reload the list on success."""
+        self._end_operation([self._startup_refresh_button], None)
+        action = "habilitada" if result.enabled else "deshabilitada"
+        if result.success:
+            self._append_log(self._startup_log, f"Entrada {result.name} {action}.")
+            audit("startup", f"name={result.name} estado={action}")
+            self._startup_reload_list()
+        else:
+            self._append_log(
+                self._startup_log,
+                f"No se pudo actualizar {result.name}: "
+                f"{result.error or 'Error desconocido.'}",
+                error=True,
+            )
+
+    def _startup_reload_list(self) -> None:
+        """Quietly reload the entries and re-render without UI lifecycle noise."""
+        def _complete(payload: tuple[list[StartupEntry], list[str]]) -> None:
+            try:
+                self.after(0, self._startup_store_entries, payload)
+            except (TclError, RuntimeError):
+                pass
+
+        try:
+            self._startup_manager.list_entries_async(_complete, None)
+        except Exception:
+            pass
+
+    def _startup_boot_done(self, info: BootInfo) -> None:
+        """Show the boot time and uptime label."""
+        uptime = float(info.uptime_hours or 0.0)
+        self._startup_boot_label.configure(
+            text=f"Último inicio: {info.boot_time} (hace {uptime:.1f} h)"
+        )
+        for error in info.errors:
+            self._append_log(self._startup_log, error, error=True)
 
     # ------------------------------------------------------------------ close
 
