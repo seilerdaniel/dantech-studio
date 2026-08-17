@@ -26,8 +26,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 import customtkinter as ctk
+from customtkinter import filedialog
 from tkinter import TclError
 
+from core.disk_analyzer import DiskAnalyzer, DiskHealth, DiskUsage
 from core.installer import Installer, WingetResult
 from core.malware_cleaner import MalwareCleaner, ScanReport
 from core.memory_optimizer import (
@@ -36,6 +38,7 @@ from core.memory_optimizer import (
     MemoryOptimizer,
     RamReport,
 )
+from core.report_generator import ActionRecord, ReportGenerator
 from core.system_repair import RepairReport, SystemRepair
 from utils import process_runner
 from utils.process_runner import CommandResult
@@ -48,8 +51,26 @@ except ImportError:  # pragma: no cover - telemetry degrades gracefully
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
+def _resolve_base_path() -> Path:
+    """Return the app base directory, handling PyInstaller bundles.
+
+    A frozen (PyInstaller) build keeps the bundled resources under
+    ``sys._MEIPASS``; a source checkout resolves the project root next to
+    this ``gui`` package.
+    """
+    if getattr(sys, "frozen", False):
+        bundle = getattr(sys, "_MEIPASS", None)
+        if bundle:
+            return Path(bundle)
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+#: Project root, robust to source checkouts and PyInstaller bundles.
+_BASE_PATH: Path = _resolve_base_path()
+
 #: Absolute path of the PowerShell maintenance script executed by the Scripts view.
-_SCRIPT_PATH: Path = Path(__file__).resolve().parents[1] / "scripts" / "optimize_windows.ps1"
+_SCRIPT_PATH: Path = _BASE_PATH / "scripts" / "optimize_windows.ps1"
 
 #: Ordered sidebar navigation labels (view names, Spanish UI strings).
 _NAV_ITEMS: tuple[str, ...] = (
@@ -68,6 +89,11 @@ _NAV_INACTIVE_FG: str = "transparent"
 #: Log line colors.
 _LOG_COLOR_INFO: str = "#dce4ee"
 _LOG_COLOR_ERROR: str = "#ff6b6b"
+
+#: Status banner / indicator colors (success, warning, failure).
+_COLOR_OK: str = "#4caf50"
+_COLOR_WARN: str = "#f39c12"
+_COLOR_BAD: str = "#e74c3c"
 
 _MB: float = 1024.0 ** 2
 _GB: float = 1024.0 ** 3
@@ -108,6 +134,8 @@ class DanTechStudioApp(ctk.CTk):
         self._system_repair = SystemRepair()
         self._malware_cleaner = MalwareCleaner()
         self._installer = Installer()
+        self._report_generator = ReportGenerator()
+        self._disk_analyzer = DiskAnalyzer()
 
         self._active_buttons: list[Any] = []
         self._active_progress: Optional[Any] = None
@@ -491,10 +519,10 @@ class DanTechStudioApp(ctk.CTk):
     # --------------------------------------------------------------- dashboard
 
     def _build_dashboard(self) -> ctk.CTkFrame:
-        """Build the telemetry view: CPU/RAM gauges and top memory processes."""
+        """Build the telemetry view: gauges, quick actions, disk health and log."""
         frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(8, weight=1)
+        frame.grid_rowconfigure(13, weight=1)
 
         title = self._section_title(frame, "Dashboard")
         title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 12))
@@ -522,14 +550,285 @@ class DanTechStudioApp(ctk.CTk):
         )
         self._dash_ram_info.grid(row=5, column=0, sticky="w", padx=16, pady=(0, 8))
 
+        actions_row = ctk.CTkFrame(frame, fg_color="transparent")
+        actions_row.grid(row=6, column=0, sticky="ew", padx=16, pady=(8, 4))
+        actions_row.grid_columnconfigure(2, weight=1)
+
+        self._dash_export_button = ctk.CTkButton(
+            actions_row,
+            text="Exportar Informe (PDF/HTML)",
+            command=self._dashboard_export_report,
+        )
+        self._dash_export_button.grid(row=0, column=0, padx=(0, 8))
+
+        self._dash_express_button = ctk.CTkButton(
+            actions_row,
+            text="⚡ Mantenimiento Express (1-Clic)",
+            fg_color=_NAV_ACTIVE_FG,
+            hover_color="#155a8a",
+            command=self._dashboard_express_maintenance,
+        )
+        self._dash_express_button.grid(row=0, column=1)
+
+        self._dash_express_progress = ctk.CTkProgressBar(frame, mode="determinate")
+        self._dash_express_progress.set(0)
+        self._dash_express_progress.grid(row=7, column=0, sticky="ew", padx=16, pady=(4, 2))
+
+        self._dash_express_status = ctk.CTkLabel(
+            frame,
+            text="Mantenimiento Express disponible.",
+            font=("Segoe UI", 12),
+            text_color="#8a8a8a",
+        )
+        self._dash_express_status.grid(row=8, column=0, sticky="w", padx=16, pady=(0, 6))
+
+        self._dash_banner = ctk.CTkLabel(
+            frame,
+            text="",
+            font=("Segoe UI", 13, "bold"),
+            corner_radius=6,
+            fg_color=_COLOR_OK,
+            text_color="#0d0d0d",
+        )
+        self._dash_banner.grid_remove()
+
+        disk_header = ctk.CTkLabel(
+            frame, text="Salud de Disco", font=("Segoe UI", 14, "bold")
+        )
+        disk_header.grid(row=10, column=0, sticky="w", padx=16, pady=(8, 2))
+
+        self._dash_disk_label = ctk.CTkLabel(
+            frame,
+            text="Consultando salud del disco...",
+            font=("Segoe UI", 13),
+            text_color="#8a8a8a",
+        )
+        self._dash_disk_label.grid(row=11, column=0, sticky="w", padx=16, pady=(0, 6))
+
         processes_header = ctk.CTkLabel(
             frame, text="Procesos con más memoria", font=("Segoe UI", 14, "bold")
         )
-        processes_header.grid(row=6, column=0, sticky="w", padx=16, pady=(12, 4))
+        processes_header.grid(row=12, column=0, sticky="w", padx=16, pady=(8, 4))
 
         self._dash_procs_box = ctk.CTkTextbox(frame, wrap="word", state="disabled")
-        self._dash_procs_box.grid(row=8, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self._dash_procs_box.grid(row=13, column=0, sticky="nsew", padx=16, pady=(0, 8))
+
+        self._dash_log = self._section_log(frame, row=14, height=110)
+        self._start_disk_health_fetch()
         return frame
+
+    def _dashboard_export_report(self) -> None:
+        """Export a diagnostic report (PDF/HTML) chosen through a save dialog."""
+        target = filedialog.asksaveasfilename(
+            title="Exportar informe",
+            defaultextension=".pdf",
+            filetypes=[("PDF", "*.pdf"), ("HTML", "*.html")],
+            initialfile="informe_dantech_studio",
+        )
+        if not target:
+            return
+        kind = "html" if Path(target).suffix.lower() == ".html" else "pdf"
+        actions = self._session_actions()
+        self._launch(
+            "Exportar informe",
+            [self._dash_export_button],
+            None,
+            self._dash_log,
+            lambda complete, fail: self._report_generator.generate_async(
+                kind, Path(target), actions, on_complete=complete, on_error=fail
+            ),
+            self._dashboard_report_done,
+            self._dashboard_report_error,
+        )
+
+    def _session_actions(self) -> list[ActionRecord]:
+        """Build the action list for the report export (no session registry yet)."""
+        return [
+            ActionRecord(
+                label="Informe generado desde DanTech Studio",
+                detail=time.strftime("Exportado el %d/%m/%Y a las %H:%M"),
+                status="ok",
+            )
+        ]
+
+    def _dashboard_report_done(self, path: Path) -> None:
+        """Log the path where the report was written."""
+        self._end_operation([self._dash_export_button], None)
+        self._append_log(self._dash_log, f"Informe guardado: {path}")
+
+    def _dashboard_report_error(self, error: Any) -> None:
+        """Log a report-export error."""
+        self._end_operation([self._dash_export_button], None)
+        self._log_error(self._dash_log, error)
+
+    def _dashboard_express_maintenance(self) -> None:
+        """Run the one-click maintenance sequence on a daemon thread.
+
+        Memory optimization is synchronous (10-60 s), so the whole sequence
+        runs off the main thread; only the progress bar and status labels are
+        refreshed through ``self.after``.
+        """
+        self._begin_operation([self._dash_express_button], self._dash_express_progress)
+        self._dash_express_status.configure(text="Limpiando temporales...")
+        self._hide_dashboard_banner()
+
+        def _update_status(text: str) -> None:
+            try:
+                self.after(0, lambda: self._dash_express_status.configure(text=text))
+            except TclError:
+                pass
+
+        def _worker() -> None:
+            total_bytes: float = 0.0
+            warnings: list[str] = []
+            try:
+                _update_status("Limpiando temporales y memoria RAM...")
+                combined = self._memory_optimizer.optimize_all()
+                total_bytes += sum(
+                    float(temp.bytes_freed) for temp in combined.temp_reports
+                )
+                if combined.ram is not None:
+                    total_bytes += combined.ram.working_set_trimmed_mb * _MB
+                warnings.extend(combined.errors)
+
+                _update_status("Vaciando cache de red...")
+                dns = process_runner.run_command(["ipconfig", "/flushdns"])
+                if not dns.success:
+                    warnings.append(dns.stderr.strip() or "ipconfig /flushdns falló.")
+
+                _update_status("Vaciando papelera de reciclaje...")
+                recycle = process_runner.run_command(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-Command",
+                        "Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
+                    ]
+                )
+                if not recycle.success:
+                    warnings.append(
+                        recycle.stderr.strip() or "No se pudo vaciar la papelera."
+                    )
+
+                _update_status("Optimizando Windows...")
+                if not _SCRIPT_PATH.is_file():
+                    warnings.append(
+                        f"No se encontró el script de mantenimiento en {_SCRIPT_PATH}."
+                    )
+                else:
+                    powershell = process_runner.find_executable(("powershell.exe",))
+                    if powershell is None:
+                        warnings.append("No se encontró powershell.exe.")
+                    else:
+                        ps1 = process_runner.run_command(
+                            [
+                                str(powershell),
+                                "-NoProfile",
+                                "-ExecutionPolicy",
+                                "Bypass",
+                                "-File",
+                                str(_SCRIPT_PATH.resolve()),
+                            ]
+                        )
+                        if not ps1.success:
+                            warnings.append(
+                                "El script de mantenimiento no completó correctamente."
+                            )
+            except Exception as exc:  # pragma: no cover - defensive
+                warnings.append(f"Error inesperado: {exc}")
+            try:
+                self.after(0, self._dashboard_express_done, total_bytes, warnings)
+            except TclError:
+                pass
+
+        threading.Thread(target=_worker, name="express-maintenance", daemon=True).start()
+
+    def _dashboard_express_done(self, total_bytes: float, warnings: list[str]) -> None:
+        """Stop the express indicators and show the result banner."""
+        self._end_operation([self._dash_express_button], self._dash_express_progress)
+        self._dash_express_status.configure(text="Mantenimiento Express disponible.")
+        freed_text = self._format_size(total_bytes)
+        if warnings:
+            self._show_dashboard_banner(
+                f"Mantenimiento Express finalizado - {freed_text} liberados "
+                "(con advertencias)",
+                _COLOR_WARN,
+            )
+        else:
+            self._show_dashboard_banner(
+                f"Mantenimiento Express completado - {freed_text} liberados",
+                _COLOR_OK,
+            )
+
+    def _show_dashboard_banner(self, text: str, color: str) -> None:
+        """Display the colored result banner on the dashboard."""
+        self._dash_banner.configure(text=text, fg_color=color, text_color="#0d0d0d")
+        self._dash_banner.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 6))
+
+    def _hide_dashboard_banner(self) -> None:
+        """Hide the result banner (reset before the next express run)."""
+        self._dash_banner.grid_remove()
+
+    def _start_disk_health_fetch(self) -> None:
+        """Fetch SMART health and C: usage once, asynchronously."""
+        analyzer = self._disk_analyzer
+
+        def _complete(disks: list[DiskHealth]) -> None:
+            try:
+                usage = analyzer.get_disk_usage()
+            except Exception:
+                usage = None
+            try:
+                self.after(0, self._dashboard_disk_done, disks, usage)
+            except TclError:
+                pass
+
+        def _fail(error: Any) -> None:
+            try:
+                self.after(0, self._dashboard_disk_error, error)
+            except TclError:
+                pass
+
+        try:
+            analyzer.get_smart_health_async(_complete, _fail)
+        except Exception as exc:
+            try:
+                self.after(0, self._dashboard_disk_error, exc)
+            except TclError:
+                pass
+
+    def _dashboard_disk_done(
+        self, disks: list[DiskHealth], usage: Optional[DiskUsage]
+    ) -> None:
+        """Render the first disk health plus the C: free space."""
+        disk_text = "Sin datos (requiere permisos de administrador)"
+        color = _COLOR_WARN
+        if disks and disks[0].health_status != "Unknown":
+            first = disks[0]
+            health = first.health_status
+            if health == "Unhealthy":
+                color = _COLOR_BAD
+            elif health == "Healthy":
+                color = _COLOR_OK
+            temperature = (
+                f", {first.temperature_c:.0f} °C"
+                if first.temperature_c is not None
+                else ""
+            )
+            disk_text = (
+                f"{first.friendly_name} ({first.media_type}) - {health}{temperature}"
+            )
+        if usage is not None and usage.total_gb > 0:
+            disk_text += f" | C: libre {usage.free_gb:.1f} GB de {usage.total_gb:.1f} GB"
+        self._dash_disk_label.configure(text=disk_text, text_color=color)
+
+    def _dashboard_disk_error(self, error: Any) -> None:
+        """Show a warning when the disk query fails entirely."""
+        self._dash_disk_label.configure(
+            text="Sin datos (requiere permisos de administrador)",
+            text_color=_COLOR_WARN,
+        )
+        self._append_log(self._dash_log, f"Consulta de salud del disco: {error}", error=True)
 
     def _top_memory_processes(self, limit: int = 5) -> list[tuple[str, float]]:
         """Return the top-N processes by RSS as (name, RSS in MB)."""
@@ -768,7 +1067,14 @@ class DanTechStudioApp(ctk.CTk):
         )
         network_btn.grid(row=0, column=2, padx=8)
 
-        self._repair_buttons = [sfc_btn, dism_btn, network_btn]
+        restore_btn = ctk.CTkButton(
+            buttons_row,
+            text="Crear punto de restauración",
+            command=self._repair_restore_point,
+        )
+        restore_btn.grid(row=0, column=3, padx=8)
+
+        self._repair_buttons = [sfc_btn, dism_btn, network_btn, restore_btn]
 
         self._repair_log = self._section_log(frame, row=5)
         return frame
@@ -814,6 +1120,34 @@ class DanTechStudioApp(ctk.CTk):
             self._repair_network_done,
             self._repair_error,
         )
+
+    def _repair_restore_point(self) -> None:
+        """Create a System Restore checkpoint in the background."""
+        self._launch(
+            "Crear punto de restauración",
+            self._repair_buttons,
+            self._repair_progress,
+            self._repair_log,
+            lambda complete, fail: self._system_repair.create_restore_point_async(
+                on_complete=complete, on_error=fail
+            ),
+            self._repair_restore_done,
+            self._repair_error,
+        )
+
+    def _repair_restore_done(self, result: CommandResult) -> None:
+        """Log the restore-point outcome (System Restore can be disabled)."""
+        self._end_operation(self._repair_buttons, self._repair_progress)
+        if result.success:
+            self._append_log(self._repair_log, "Punto de restauración creado correctamente.")
+            return
+        detail = (result.stderr or "").strip()
+        if not detail:
+            detail = (
+                "No se pudo crear (System Restore deshabilitado o "
+                "requiere administrador)."
+            )
+        self._append_log(self._repair_log, detail, error=True)
 
     def _repair_command_done(self, operation: str, result: CommandResult) -> None:
         """Log the outcome of a single-command repair (SFC/DISM)."""

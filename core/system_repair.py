@@ -229,6 +229,72 @@ class SystemRepair:
         return thread
 
 
+    # ------------------------------------------------------ restore point
+
+    def create_restore_point(
+        self,
+        description: str = "DanTech Studio - antes de mantenimiento",
+    ) -> CommandResult:
+        """Create a System Restore checkpoint via ``Checkpoint-Computer``.
+
+        Requires Administrator privileges. The description is sanitized (single
+        quotes removed) before being interpolated into the command line.
+
+        Note: when System Restore is disabled on the machine, PowerShell exits
+        with a non-zero return code. That failure is reported through the
+        returned :class:`CommandResult`; it does NOT raise.
+
+        Args:
+            description: Label stored with the restore point.
+
+        Returns:
+            A :class:`CommandResult` with the Checkpoint-Computer output.
+        """
+        ensure_windows()
+        if not is_admin():
+            return _admin_blocked_result()
+
+        safe_description = description.replace("'", "").strip()
+        command = (
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            f"Checkpoint-Computer -Description '{safe_description}' "
+            "-RestorePointType MODIFY_SETTINGS",
+        )
+        return run_command(command)
+
+    def create_restore_point_async(
+        self,
+        description: str = "DanTech Studio - antes de mantenimiento",
+        on_complete: Callable[[CommandResult], None] = None,
+        on_error: Optional[Callable[[CommandResult], None]] = None,
+    ) -> threading.Thread:
+        """Run ``create_restore_point`` in a background thread.
+
+        Args:
+            description: Label stored with the restore point.
+            on_complete: Called with the :class:`CommandResult` when finished.
+            on_error: Called when execution could not even start.
+
+        Returns:
+            The started daemon thread.
+        """
+        ensure_windows()
+        if not is_admin():
+            return _spawn_immediate_result(_admin_blocked_result(), on_complete, on_error)
+
+        safe_description = description.replace("'", "").strip()
+        command = (
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            f"Checkpoint-Computer -Description '{safe_description}' "
+            "-RestorePointType MODIFY_SETTINGS",
+        )
+        return run_command_async(command, on_complete=on_complete, on_error=on_error)
+
+
 def _spawn_immediate_repair_report(
     report: RepairReport,
     on_complete: Callable[[RepairReport], None],
