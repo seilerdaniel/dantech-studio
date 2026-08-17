@@ -16,5 +16,9 @@ Desktop.ini
 # Logs
 *.log
 
+# Env files
+.env*
+.env.local
+
 # Tooling metadata (gentle-ai skill registry, auto-generated)
 .atl/
