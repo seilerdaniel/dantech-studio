@@ -30,11 +30,14 @@ from utils.process_runner import (
 _INSTALL_TIMEOUT = 900.0
 _UPGRADE_ALL_TIMEOUT = 1800.0
 
-#: Flags reused across install/upgrade commands.
+#: Flags reused across install/upgrade commands. ``--disable-interactivity``
+#: keeps winget from prompting and avoids msstore source locks
+#: (error 0x8a15000f) when running non-interactively.
 _AGREEMENT_FLAGS: Sequence[str] = (
     "--silent",
     "--accept-package-agreements",
     "--accept-source-agreements",
+    "--disable-interactivity",
 )
 
 

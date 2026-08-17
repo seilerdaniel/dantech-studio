@@ -51,26 +51,8 @@ except ImportError:  # pragma: no cover - telemetry degrades gracefully
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
-def _resolve_base_path() -> Path:
-    """Return the app base directory, handling PyInstaller bundles.
-
-    A frozen (PyInstaller) build keeps the bundled resources under
-    ``sys._MEIPASS``; a source checkout resolves the project root next to
-    this ``gui`` package.
-    """
-    if getattr(sys, "frozen", False):
-        bundle = getattr(sys, "_MEIPASS", None)
-        if bundle:
-            return Path(bundle)
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parents[1]
-
-
-#: Project root, robust to source checkouts and PyInstaller bundles.
-_BASE_PATH: Path = _resolve_base_path()
-
 #: Absolute path of the PowerShell maintenance script executed by the Scripts view.
-_SCRIPT_PATH: Path = _BASE_PATH / "scripts" / "optimize_windows.ps1"
+_SCRIPT_PATH: Path = Path(process_runner.get_resource_path("scripts/optimize_windows.ps1"))
 
 #: Ordered sidebar navigation labels (view names, Spanish UI strings).
 _NAV_ITEMS: tuple[str, ...] = (
@@ -107,8 +89,12 @@ class DanTechStudioApp(ctk.CTk):
     so the widgets are only ever touched from the main thread.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, script_path: Optional[str] = None) -> None:
         """Build the window, the sidebar and the six views, then start telemetry.
+
+        Args:
+            script_path: Optional absolute path of the PowerShell maintenance
+                script; defaults to the resolved bundled ``_SCRIPT_PATH``.
 
         Automatic DPI-aware scaling is deactivated BEFORE any widget exists:
         on Windows it can leave the scale factor as None, which crashes
@@ -116,6 +102,8 @@ class DanTechStudioApp(ctk.CTk):
         ("'NoneType' and 'float'"). Forcing a fixed scale keeps the layout
         deterministic across monitors.
         """
+        self._script_path: Path = Path(script_path) if script_path else _SCRIPT_PATH
+
         ctk.deactivate_automatic_dpi_awareness()
         ctk.set_widget_scaling(1.0)
         ctk.set_window_scaling(1.0)
@@ -711,9 +699,9 @@ class DanTechStudioApp(ctk.CTk):
                     )
 
                 _update_status("Optimizando Windows...")
-                if not _SCRIPT_PATH.is_file():
+                if not self._script_path.is_file():
                     warnings.append(
-                        f"No se encontró el script de mantenimiento en {_SCRIPT_PATH}."
+                        f"No se encontró el script de mantenimiento en {self._script_path}."
                     )
                 else:
                     powershell = process_runner.find_executable(("powershell.exe",))
@@ -727,7 +715,7 @@ class DanTechStudioApp(ctk.CTk):
                                 "-ExecutionPolicy",
                                 "Bypass",
                                 "-File",
-                                str(_SCRIPT_PATH.resolve()),
+                                str(self._script_path.resolve()),
                             ]
                         )
                         if not ps1.success:
@@ -1465,10 +1453,10 @@ class DanTechStudioApp(ctk.CTk):
 
     def _run_maintenance_script(self) -> None:
         """Launch the PowerShell maintenance script through process_runner."""
-        if not _SCRIPT_PATH.is_file():
+        if not self._script_path.is_file():
             self._append_log(
                 self._scripts_log,
-                f"No se encontró el script de mantenimiento en {_SCRIPT_PATH}.",
+                f"No se encontró el script de mantenimiento en {self._script_path}.",
                 error=True,
             )
             return
@@ -1478,7 +1466,7 @@ class DanTechStudioApp(ctk.CTk):
             self._scripts_progress,
             self._scripts_log,
             lambda complete, fail: process_runner.run_powershell_async(
-                str(_SCRIPT_PATH), on_complete=complete, on_error=fail
+                str(self._script_path), on_complete=complete, on_error=fail
             ),
             self._scripts_done,
             self._scripts_error,

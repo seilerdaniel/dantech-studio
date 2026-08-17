@@ -153,6 +153,20 @@ def find_executable(names: Iterable[str]) -> Optional[Path]:
     return None
 
 
+def get_resource_path(relative_path: str) -> str:
+    """Resolve a bundled resource path in source and PyInstaller builds.
+
+    PyInstaller onefile extracts bundled files under ``sys._MEIPASS``; a
+    frozen onedir build keeps them next to the executable; a source checkout
+    resolves relative to the current working directory.
+    """
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, relative_path)
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
+
 def run_command(
     command: Sequence[str],
     timeout: Optional[float] = None,

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -38,6 +39,15 @@ _PROCESS_QUERY_RIGHTS = 0x0100 | 0x0008
 _SKIP_PROCESS_NAMES = {"system", "system idle process", "idle"}
 
 _T = TypeVar("_T")
+
+
+def _is_silent_delete_error(exc: BaseException) -> bool:
+    """True for permission/sharing violations that must not spam the report."""
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (5, 32):
+        return True
+    return False
 
 
 @dataclass
@@ -173,16 +183,28 @@ class MemoryOptimizer:
                     os.remove(entry.path)
                     report.files_deleted += 1
                 except (PermissionError, OSError) as exc:
-                    report.errors.append(f"No se pudo eliminar el enlace {entry.path}: {exc}")
+                    if not _is_silent_delete_error(exc):
+                        report.errors.append(
+                            f"No se pudo eliminar el enlace {entry.path}: {exc}"
+                        )
                 return
 
             if entry.is_dir(follow_symlinks=False):
+                # Skip PyInstaller runtime folders: sys._MEIPASS points to a
+                # "_MEIxxxxx" directory of the CURRENT process; deleting it
+                # breaks the running executable. The prefix also covers any
+                # _MEI folder of other running instances.
+                if entry.name.startswith("_MEI"):
+                    return
                 self._cleanup_dir(Path(entry.path), depth + 1, report, max_depth)
                 try:
                     os.rmdir(entry.path)
                     report.files_deleted += 1
                 except (PermissionError, OSError) as exc:
-                    report.errors.append(f"No se pudo eliminar la carpeta {entry.path}: {exc}")
+                    if not _is_silent_delete_error(exc):
+                        report.errors.append(
+                            f"No se pudo eliminar la carpeta {entry.path}: {exc}"
+                        )
                 return
 
             if entry.is_file(follow_symlinks=False):
@@ -192,7 +214,10 @@ class MemoryOptimizer:
                     report.bytes_freed += size
                     report.files_deleted += 1
                 except (PermissionError, OSError) as exc:
-                    report.errors.append(f"No se pudo eliminar el archivo {entry.path}: {exc}")
+                    if not _is_silent_delete_error(exc):
+                        report.errors.append(
+                            f"No se pudo eliminar el archivo {entry.path}: {exc}"
+                        )
         except (PermissionError, OSError, FileNotFoundError) as exc:
             report.errors.append(f"No se pudo acceder a {entry.path}: {exc}")
 
