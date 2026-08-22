@@ -122,6 +122,35 @@ def run_as_admin(operation: str, show_window: bool = False) -> bool:
     return result > 32
 
 
+def start_detached(operation: str, params: Optional[str] = None) -> bool:
+    """Launch an executable/document detached, without waiting for it.
+
+    Fire-and-forget counterpart of :func:`run_command`: the caller NEVER
+    blocks and no output is captured. Intended for interactive tools opened
+    on behalf of the user (QuickAssist, ms-remote-assistance) where waiting
+    would freeze the GUI until the tool is closed.
+
+    Args:
+        operation: Executable or document to open (absolute path preferred).
+        params: Optional argument string passed to the target.
+
+    Returns:
+        True when the launch was accepted, False otherwise.
+    """
+    ensure_windows()
+    import ctypes
+
+    try:
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, None, operation, params, None, _SW_SHOW
+        )
+    except (AttributeError, OSError) as exc:
+        return False
+
+    # ShellExecuteW returns a value > 32 on success.
+    return result > 32
+
+
 def find_executable(names: Iterable[str]) -> Optional[Path]:
     """Locate an executable by name across PATH and common system folders.
 

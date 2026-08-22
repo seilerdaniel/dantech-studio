@@ -57,6 +57,7 @@ from core.system_cleaner import (
     CleanResult,
     SystemCleaner,
 )
+from core.system_info import BatteryHealth, ProductKeyInfo, SystemInfo
 from core.system_repair import RepairReport, SystemRepair
 from utils import process_runner
 from utils.process_runner import CommandResult
@@ -168,6 +169,7 @@ class DanTechStudioApp(ctk.CTk):
         self._network_diagnostic = NetworkDiagnostic()
         self._startup_manager = StartupManager()
         self._system_cleaner = SystemCleaner()
+        self._system_info = SystemInfo()
         self._app_uninstaller = AppUninstaller()
         self._driver_manager = DriverManager()
 
@@ -564,7 +566,7 @@ class DanTechStudioApp(ctk.CTk):
         """Build the telemetry view: gauges, quick actions, disk health and log."""
         frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(13, weight=1)
+        frame.grid_rowconfigure(14, weight=1)
 
         title = self._section_title(frame, "Dashboard")
         title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 12))
@@ -594,7 +596,7 @@ class DanTechStudioApp(ctk.CTk):
 
         actions_row = ctk.CTkFrame(frame, fg_color="transparent")
         actions_row.grid(row=6, column=0, sticky="ew", padx=16, pady=(8, 4))
-        actions_row.grid_columnconfigure(3, weight=1)
+        actions_row.grid_columnconfigure(4, weight=1)
 
         self._dash_export_button = ctk.CTkButton(
             actions_row,
@@ -612,12 +614,19 @@ class DanTechStudioApp(ctk.CTk):
         )
         self._dash_express_button.grid(row=0, column=1)
 
+        self._dash_remote_button = ctk.CTkButton(
+            actions_row,
+            text="Soporte Remoto",
+            command=self._dashboard_remote_support,
+        )
+        self._dash_remote_button.grid(row=0, column=2, padx=(8, 0))
+
         self._dash_qr_button = ctk.CTkButton(
             actions_row,
             text="Mostrar QR de Contacto",
             command=self._dashboard_show_qr,
         )
-        self._dash_qr_button.grid(row=0, column=2, padx=(8, 0))
+        self._dash_qr_button.grid(row=0, column=3, padx=(8, 0))
 
         self._dash_express_progress = ctk.CTkProgressBar(frame, mode="determinate")
         self._dash_express_progress.set(0)
@@ -641,10 +650,33 @@ class DanTechStudioApp(ctk.CTk):
         )
         self._dash_banner.grid_remove()
 
+        info_row = ctk.CTkFrame(frame, fg_color="transparent")
+        info_row.grid(row=10, column=0, sticky="ew", padx=16, pady=(6, 2))
+        info_row.grid_columnconfigure(0, weight=1, uniform="dashinfo")
+        info_row.grid_columnconfigure(1, weight=1, uniform="dashinfo")
+
+        self._dash_battery_label = ctk.CTkLabel(
+            info_row,
+            text="Batería: consultando...",
+            font=("Segoe UI", 13),
+            text_color="#8a8a8a",
+            anchor="w",
+        )
+        self._dash_battery_label.grid(row=0, column=0, sticky="ew")
+
+        self._dash_license_label = ctk.CTkLabel(
+            info_row,
+            text="Licencia OEM: consultando...",
+            font=("Segoe UI", 13),
+            text_color="#8a8a8a",
+            anchor="w",
+        )
+        self._dash_license_label.grid(row=0, column=1, sticky="ew", padx=(16, 0))
+
         disk_header = ctk.CTkLabel(
             frame, text="Salud de Disco", font=("Segoe UI", 14, "bold")
         )
-        disk_header.grid(row=10, column=0, sticky="w", padx=16, pady=(8, 2))
+        disk_header.grid(row=11, column=0, sticky="w", padx=16, pady=(8, 2))
 
         self._dash_disk_label = ctk.CTkLabel(
             frame,
@@ -652,18 +684,19 @@ class DanTechStudioApp(ctk.CTk):
             font=("Segoe UI", 13),
             text_color="#8a8a8a",
         )
-        self._dash_disk_label.grid(row=11, column=0, sticky="w", padx=16, pady=(0, 6))
+        self._dash_disk_label.grid(row=12, column=0, sticky="w", padx=16, pady=(0, 6))
 
         processes_header = ctk.CTkLabel(
             frame, text="Procesos con más memoria", font=("Segoe UI", 14, "bold")
         )
-        processes_header.grid(row=12, column=0, sticky="w", padx=16, pady=(8, 4))
+        processes_header.grid(row=13, column=0, sticky="w", padx=16, pady=(8, 4))
 
         self._dash_procs_box = ctk.CTkTextbox(frame, wrap="word", state="disabled")
-        self._dash_procs_box.grid(row=13, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        self._dash_procs_box.grid(row=14, column=0, sticky="nsew", padx=16, pady=(0, 8))
 
-        self._dash_log = self._section_log(frame, row=14, height=110)
+        self._dash_log = self._section_log(frame, row=15, height=110)
         self._start_disk_health_fetch()
+        self._start_system_info_fetch()
         return frame
 
     def _dashboard_export_report(self) -> None:
@@ -945,6 +978,105 @@ class DanTechStudioApp(ctk.CTk):
             text_color=_COLOR_WARN,
         )
         self._append_log(self._dash_log, f"Consulta de salud del disco: {error}", error=True)
+
+    def _start_system_info_fetch(self) -> None:
+        """Fetch battery health and the OEM license once, asynchronously."""
+
+        def _worker() -> None:
+            try:
+                battery = self._system_info.get_battery_health()
+            except Exception as exc:
+                battery = BatteryHealth(errors=[str(exc)])
+            try:
+                key_info = self._system_info.get_windows_product_key()
+            except Exception as exc:
+                key_info = ProductKeyInfo(errors=[str(exc)])
+            try:
+                self.after(0, self._dashboard_system_info_done, battery, key_info)
+            except TclError:
+                pass
+
+        threading.Thread(target=_worker, name="system-info", daemon=True).start()
+
+    def _dashboard_system_info_done(
+        self, battery: BatteryHealth, key_info: ProductKeyInfo
+    ) -> None:
+        """Render the battery-health card and the OEM-license card."""
+        if not battery.present:
+            self._dash_battery_label.configure(
+                text=f"Batería: {battery.status_message}", text_color="#8a8a8a"
+            )
+        else:
+            charge = (
+                f", carga {battery.charge_percent:.0f}%"
+                if battery.charge_percent is not None
+                else ""
+            )
+            cycles = (
+                f", {battery.cycle_count} ciclos"
+                if battery.cycle_count is not None
+                else ""
+            )
+            wear = battery.wear_percent
+            if wear is None:
+                text = f"Batería: presente{cycles}{charge}"
+                color: str = _COLOR_WARN
+            else:
+                text = (
+                    f"Batería: salud {100.0 - wear:.0f}% "
+                    f"(desgaste {wear:.0f}%){cycles}{charge}"
+                )
+                if wear <= 20.0:
+                    color = _COLOR_OK
+                elif wear <= 40.0:
+                    color = _COLOR_WARN
+                else:
+                    color = _COLOR_BAD
+            self._dash_battery_label.configure(text=text, text_color=color)
+
+        if key_info.product_key:
+            edition = f" ({key_info.edition})" if key_info.edition else ""
+            self._dash_license_label.configure(
+                text=f"Licencia OEM{edition}: {key_info.product_key}",
+                text_color="#06b6d4",
+            )
+        else:
+            self._dash_license_label.configure(
+                text="Licencia OEM: no encontrada en BIOS/UEFI",
+                text_color="#8a8a8a",
+            )
+
+        for error in (battery.errors[:1] + key_info.errors[:1]):
+            self._append_log(self._dash_log, error, error=True)
+
+    def _dashboard_remote_support(self) -> None:
+        """Launch QuickAssist (or legacy msra) detached, without blocking."""
+        target = process_runner.find_executable(("QuickAssist.exe",))
+        if target is None:
+            target = process_runner.find_executable(("msra.exe",))
+        if target is None:
+            audit("remote_support", "herramienta-no-encontrada")
+            self._append_log(
+                self._dash_log,
+                "No se encontró Quick Assist ni Asistencia Remota en este equipo.",
+                error=True,
+            )
+            return
+
+        file_path = str(target)
+        params = None
+        if " " in file_path and not file_path.startswith('"'):
+            head, _, tail = file_path.partition(" ")
+            if head.lower().endswith(".exe"):
+                file_path, params = head, tail
+        launched = process_runner.start_detached(file_path, params)
+        audit("remote_support", f"tool={target.name} ok={int(launched)}")
+        if launched:
+            self._append_log(self._dash_log, f"Asistencia remota iniciada: {target.name}.")
+        else:
+            self._append_log(
+                self._dash_log, f"No se pudo iniciar {target.name}.", error=True
+            )
 
     def _top_memory_processes(self, limit: int = 5) -> list[tuple[str, float]]:
         """Return the top-N processes by RSS as (name, RSS in MB)."""
