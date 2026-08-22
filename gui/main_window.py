@@ -39,7 +39,12 @@ from core.app_uninstaller import (
 from core.audit import audit
 from core.data_recovery import DataRecovery, EXTENSION_GROUPS, RecoveryJobResult
 from core.driver_manager import DriverInfo, DriverManager, DriverUpdateResult
-from core.disk_analyzer import DiskAnalyzer, DiskHealth, DiskUsage
+from core.disk_analyzer import (
+    DiskAnalyzer,
+    DiskHealth,
+    DiskUsage,
+    SpaceScanReport,
+)
 from core.installer import Installer, WingetResult
 from core.malware_cleaner import MalwareCleaner, ScanReport
 from core.memory_optimizer import (
@@ -51,6 +56,7 @@ from core.memory_optimizer import (
 from core.network_diagnostic import NetworkDiagnostic, NetworkResetResult, PingResult
 from core.report_generator import ActionRecord, ReportGenerator
 from core.startup_manager import BootInfo, StartupActionResult, StartupEntry, StartupManager
+from core.stress_test import StressConfig, StressReport, StressSample, StressTest
 from core.system_cleaner import (
     CleanAnalysisReport,
     CleanConfig,
@@ -59,6 +65,7 @@ from core.system_cleaner import (
 )
 from core.system_info import BatteryHealth, ProductKeyInfo, SystemInfo
 from core.system_repair import RepairReport, SystemRepair
+from core.task_scheduler import TASK_NAME, TaskScheduler
 from utils import process_runner
 from utils.process_runner import CommandResult
 
@@ -85,13 +92,16 @@ _SCRIPT_PATH: Path = Path(process_runner.get_resource_path("scripts/optimize_win
 _NAV_ITEMS: tuple[str, ...] = (
     "Dashboard",
     "Memoria",
+    "Estrés & Térmica",
     "Reparación",
     "Seguridad",
     "Apps",
+    "Analizador de Disco",
     "Scripts",
     "Recuperación",
     "Red & Conectividad",
     "Programas de Inicio",
+    "Tareas Automáticas",
 )
 
 #: Highlight colors for the active navigation button.
@@ -131,7 +141,7 @@ class DanTechStudioApp(ctk.CTk):
     """
 
     def __init__(self, script_path: Optional[str] = None) -> None:
-        """Build the window, the sidebar and the nine views, then start telemetry.
+        """Build the window, the sidebar and the twelve views, then start telemetry.
 
         Args:
             script_path: Optional absolute path of the PowerShell maintenance
@@ -172,6 +182,8 @@ class DanTechStudioApp(ctk.CTk):
         self._system_info = SystemInfo()
         self._app_uninstaller = AppUninstaller()
         self._driver_manager = DriverManager()
+        self._task_scheduler = TaskScheduler()
+        self._stress_test: Optional[StressTest] = None
 
         self._active_buttons: list[Any] = []
         self._active_progress: Optional[Any] = None
@@ -512,7 +524,7 @@ class DanTechStudioApp(ctk.CTk):
     # ---------------------------------------------------------------- content
 
     def _build_views(self) -> None:
-        """Create the content panel and register all six views."""
+        """Create the content panel and register all twelve views."""
         self.content_panel = ctk.CTkFrame(self, corner_radius=0)
         self.content_panel.grid(row=0, column=1, sticky="nsew")
         self.content_panel.grid_rowconfigure(0, weight=1)
@@ -520,13 +532,16 @@ class DanTechStudioApp(ctk.CTk):
 
         self._views["Dashboard"] = self._build_dashboard()
         self._views["Memoria"] = self._build_memory()
+        self._views["Estrés & Térmica"] = self._build_stress()
         self._views["Reparación"] = self._build_repair()
         self._views["Seguridad"] = self._build_security()
         self._views["Apps"] = self._build_apps()
+        self._views["Analizador de Disco"] = self._build_disk_analyzer()
         self._views["Scripts"] = self._build_scripts()
         self._views["Recuperación"] = self._build_recovery()
         self._views["Red & Conectividad"] = self._build_network()
         self._views["Programas de Inicio"] = self._build_startup()
+        self._views["Tareas Automáticas"] = self._build_scheduler()
 
     def _show_view(self, name: str) -> None:
         """Display one view frame and highlight its navigation button."""
@@ -2980,9 +2995,502 @@ class DanTechStudioApp(ctk.CTk):
 
     # ------------------------------------------------------------------ close
 
+    # ------------------------------------------------------- estrés & térmica
+
+    def _build_stress(self) -> ctk.CTkFrame:
+        """Build the thermal stability test view."""
+        frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(6, weight=1)
+
+        title = self._section_title(frame, "Estrés & Térmica")
+        title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
+
+        description = ctk.CTkLabel(
+            frame,
+            text="Prueba de estabilidad de CPU/RAM con corte automático si la "
+            "temperatura supera el límite seguro (85 °C).",
+            font=("Segoe UI", 12),
+            text_color="#8a8a8a",
+        )
+        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 10))
+
+        config_row = ctk.CTkFrame(frame, fg_color="transparent")
+        config_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        config_row.grid_columnconfigure(1, weight=1)
+
+        duration_label = ctk.CTkLabel(
+            config_row, text="Duración del test:", font=("Segoe UI", 13)
+        )
+        duration_label.grid(row=0, column=0, padx=(0, 8))
+
+        self._stress_duration = ctk.CTkSegmentedButton(
+            config_row, values=["1 min", "3 min"]
+        )
+        self._stress_duration.set("1 min")
+        self._stress_duration.grid(row=0, column=1, sticky="w")
+
+        temp_card = ctk.CTkFrame(frame)
+        temp_card.grid(row=3, column=0, sticky="ew", padx=16, pady=(4, 8))
+        temp_card.grid_columnconfigure(1, weight=1)
+
+        self._stress_temp_label = ctk.CTkLabel(
+            temp_card,
+            text="-- °C",
+            font=("Consolas", 44, "bold"),
+            text_color="#8a8a8a",
+        )
+        self._stress_temp_label.grid(row=0, column=0, rowspan=2, padx=(24, 24), pady=12)
+
+        self._stress_cpu_label = ctk.CTkLabel(
+            temp_card, text="CPU: -- %", font=("Segoe UI", 14)
+        )
+        self._stress_cpu_label.grid(row=0, column=1, sticky="w", pady=(18, 2))
+        self._stress_ram_label = ctk.CTkLabel(
+            temp_card, text="RAM: -- %", font=("Segoe UI", 14)
+        )
+        self._stress_ram_label.grid(row=1, column=1, sticky="w", pady=(2, 18))
+
+        self._stress_progress = ctk.CTkProgressBar(frame, mode="determinate")
+        self._stress_progress.set(0)
+        self._stress_progress.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
+
+        buttons_row = ctk.CTkFrame(frame, fg_color="transparent")
+        buttons_row.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 8))
+
+        self._stress_start_btn = ctk.CTkButton(
+            buttons_row,
+            text="Iniciar Test de Estrés",
+            fg_color=_NAV_ACTIVE_FG,
+            hover_color="#155a8a",
+            command=self._stress_start,
+        )
+        self._stress_start_btn.pack(side="left")
+
+        self._stress_stop_btn = ctk.CTkButton(
+            buttons_row,
+            text="Detener Test",
+            fg_color=_COLOR_BAD,
+            hover_color="#c0392b",
+            state="disabled",
+            command=self._stress_stop,
+        )
+        self._stress_stop_btn.pack(side="left", padx=(10, 0))
+
+        self._stress_log = self._section_log(frame, row=6, height=180)
+        return frame
+
+    def _stress_start(self) -> None:
+        """Launch the bounded stress test with live thermal telemetry."""
+        if self._stress_test is not None and self._stress_test.running:
+            return
+        minutes = 3 if self._stress_duration.get().startswith("3") else 1
+        total_seconds = minutes * 60
+        config = StressConfig(duration_seconds=total_seconds)
+        self._stress_total_seconds = total_seconds
+        self._stress_test = StressTest()
+        audit("stress_test", f"duration_min={minutes}")
+
+        def _on_sample(sample: StressSample) -> None:
+            try:
+                self.after(0, self._stress_sample_ui, sample)
+            except TclError:
+                pass
+
+        def _on_complete(report: StressReport) -> None:
+            try:
+                self.after(0, self._stress_done_ui, report)
+            except TclError:
+                pass
+
+        self._append_log(
+            self._stress_log,
+            f"Iniciando prueba de {minutes} min: el equipo puede ponerse lento.",
+        )
+        self._stress_start_btn.configure(state="disabled")
+        self._stress_stop_btn.configure(state="normal")
+        self._stress_progress.set(0)
+        started = self._stress_test.start(config, on_sample=_on_sample, on_complete=_on_complete)
+        if not started:
+            self._stress_start_btn.configure(state="normal")
+            self._stress_stop_btn.configure(state="disabled")
+            self._append_log(
+                self._stress_log, "Ya hay una prueba en ejecución.", error=True
+            )
+
+    def _stress_sample_ui(self, sample: StressSample) -> None:
+        """Refresh the live temperature/CPU/RAM indicators."""
+        temperature = sample.temperature_c
+        if temperature is None:
+            self._stress_temp_label.configure(text="-- °C", text_color="#8a8a8a")
+        else:
+            if temperature >= 85.0:
+                color: str = _COLOR_BAD
+            elif temperature >= 70.0:
+                color = _COLOR_WARN
+            else:
+                color = _COLOR_OK
+            self._stress_temp_label.configure(text=f"{temperature:.0f} °C", text_color=color)
+        self._stress_cpu_label.configure(text=f"CPU: {sample.cpu_percent:.0f} %")
+        self._stress_ram_label.configure(text=f"RAM: {sample.ram_percent:.0f} %")
+        total = float(getattr(self, "_stress_total_seconds", 60)) or 60.0
+        self._stress_progress.set(max(0.0, min(sample.elapsed_s / total, 1.0)))
+
+    def _stress_done_ui(self, report: StressReport) -> None:
+        """Log the stability verdict and restore the controls."""
+        self._stress_start_btn.configure(state="normal")
+        self._stress_stop_btn.configure(state="disabled")
+        self._stress_progress.set(1.0)
+        audit("stress_test", f"outcome={report.outcome}")
+        for warning in report.warnings:
+            self._append_log(self._stress_log, warning, error=True)
+        temp_text = (
+            f"{report.max_temperature_c:.1f} °C"
+            if report.max_temperature_c is not None
+            else "sin sensor"
+        )
+        self._append_log(self._stress_log, f"Resultado: {report.verdict}")
+        self._append_log(
+            self._stress_log,
+            f"Duración: {report.duration_s:.0f} s | Temp máxima: {temp_text} | "
+            f"CPU promedio: {report.avg_cpu_percent:.0f} % | "
+            f"RAM pico: {report.peak_ram_percent:.0f} % | Muestras: {report.samples}",
+        )
+
+    def _stress_stop(self) -> None:
+        """Abort the running stress test immediately (panic button)."""
+        if self._stress_test is None or not self._stress_test.running:
+            return
+        self._stress_test.stop()
+        self._append_log(self._stress_log, "Deteniendo la prueba...")
+
+    # ------------------------------------------------------ analizador disco
+
+    def _build_disk_analyzer(self) -> ctk.CTkFrame:
+        """Build the visual disk-space analyzer view."""
+        frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(3, weight=1)
+
+        title = self._section_title(frame, "Analizador de Disco")
+        title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
+
+        description = ctk.CTkLabel(
+            frame,
+            text="Escaneo rápido de las carpetas y tipos de archivo que más "
+            "espacio consumen en la unidad C:.",
+            font=("Segoe UI", 12),
+            text_color="#8a8a8a",
+        )
+        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 10))
+
+        actions_row = ctk.CTkFrame(frame, fg_color="transparent")
+        actions_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        actions_row.grid_columnconfigure(2, weight=1)
+
+        self._analyzer_scan_button = ctk.CTkButton(
+            actions_row,
+            text="Escanear unidad C:",
+            fg_color=_NAV_ACTIVE_FG,
+            hover_color="#155a8a",
+            command=self._analyzer_scan,
+        )
+        self._analyzer_scan_button.grid(row=0, column=0)
+
+        self._analyzer_usage_label = ctk.CTkLabel(
+            actions_row, text="", font=("Segoe UI", 12), text_color="#8a8a8a"
+        )
+        self._analyzer_usage_label.grid(row=0, column=1, padx=(14, 0), sticky="w")
+
+        self._analyzer_progress = ctk.CTkProgressBar(frame, mode="indeterminate")
+        self._analyzer_progress.set(0)
+        self._analyzer_progress.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self._analyzer_progress.grid_remove()
+
+        results = ctk.CTkTextbox(frame, wrap="none", state="disabled")
+        results.grid(row=4, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        results.tag_config("info", foreground=_LOG_COLOR_INFO)
+        results.tag_config("error", foreground=_LOG_COLOR_ERROR)
+        results.tag_config("header", foreground="#06b6d4")
+        self._analyzer_results = results
+
+        usage = self._disk_analyzer.get_disk_usage()
+        if usage.total_gb > 0:
+            self._analyzer_usage_label.configure(
+                text=f"C: libre {usage.free_gb:.1f} GB de {usage.total_gb:.1f} GB"
+            )
+        return frame
+
+    def _analyzer_scan(self) -> None:
+        """Run the heavy-space scan of C: on a daemon thread."""
+
+        def _starter(
+            complete: Callable[[Any], None], fail: Callable[[Any], None]
+        ) -> threading.Thread:
+            return self._disk_analyzer.scan_space_async(
+                root=Path("C:/"),
+                time_budget_s=90.0,
+                on_complete=complete,
+                on_error=fail,
+            )
+
+        self._begin_operation([self._analyzer_scan_button], None)
+        self._analyzer_progress.grid()
+        self._analyzer_progress.start()
+        self._launch(
+            "Escaneo de espacio (C:)",
+            [self._analyzer_scan_button],
+            None,
+            self._dash_log,
+            _starter,
+            self._after_analyzer_render,
+            self._analyzer_scan_error,
+        )
+
+    def _after_analyzer_render(self, report: SpaceScanReport) -> None:
+        """Stop indicators and render the scan into the results panel."""
+        self._end_operation([self._analyzer_scan_button], None)
+        self._analyzer_progress.stop()
+        self._analyzer_progress.grid_remove()
+        self._render_space_report(report)
+
+    def _analyzer_scan_error(self, error: Any) -> None:
+        """Restore controls after a failed scan and log the reason."""
+        self._end_operation([self._analyzer_scan_button], None)
+        self._analyzer_progress.stop()
+        self._analyzer_progress.grid_remove()
+        self._log_error(self._dash_log, error)
+
+    def _render_space_report(self, report: SpaceScanReport) -> None:
+        """Render top folders plus the per-extension breakdown as a table."""
+        audit("space_scan", f"truncated={int(report.truncated)} elapsed={report.elapsed_s:.0f}s")
+        lines: list[str] = [
+            f"ESCANEO DE ESPACIO - {report.root}",
+            f"Duración: {report.elapsed_s:.0f} s | Archivos vistos: {report.files_seen:,}"
+            + (" | RESULTADO PARCIAL (presupuesto de tiempo)" if report.truncated else ""),
+            "",
+            "TOP CARPETAS MÁS PESADAS",
+        ]
+        biggest = max((folder.size_bytes for folder in report.folders[:10]), default=0)
+        for index, folder in enumerate(report.folders[:10], start=1):
+            size_gb = folder.size_bytes / _GB
+            bar = "#" * int(round(18 * folder.size_bytes / biggest)) if biggest else ""
+            short_path = folder.path if len(folder.path) <= 34 else "..." + folder.path[-31:]
+            lines.append(
+                f"{index:>2}. {short_path:<36}{size_gb:>8.2f} GB  {bar}"
+            )
+        lines.append("")
+        lines.append("CONSUMO POR TIPO DE ARCHIVO")
+
+        shown = report.extensions[:10]
+        rest_bytes = sum(size for _, size in report.extensions[10:])
+        ext_biggest = max((size for _, size in shown), default=0)
+        for extension, size in shown:
+            size_gb = size / _GB
+            bar = "#" * int(round(14 * size / ext_biggest)) if ext_biggest else ""
+            lines.append(f"{extension:<20}{size_gb:>8.2f} GB  {bar}")
+        if rest_bytes > 0:
+            lines.append(f"{'[otros]':<20}{rest_bytes / _GB:>8.2f} GB")
+
+        if report.errors:
+            lines.append("")
+            for error in report.errors:
+                lines.append(f"Aviso: {error}")
+
+        box = self._analyzer_results
+        try:
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            for line in lines:
+                tag = (
+                    "header"
+                    if line.isupper() and len(line) > 3 and not line.startswith((" ", "."))
+                    else "info"
+                )
+                if line.lower().startswith(("aviso", "escaneo detenido")):
+                    tag = "error"
+                box.insert("end", line + "\n", tag)
+            box.see("1.0")
+            box.configure(state="disabled")
+        except TclError:
+            pass
+
+    # ---------------------------------------------------- tareas automáticas
+
+    def _build_scheduler(self) -> ctk.CTkFrame:
+        """Build the unattended maintenance scheduler view."""
+        frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(5, weight=1)
+
+        title = self._section_title(frame, "Tareas Automáticas")
+        title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
+
+        description = ctk.CTkLabel(
+            frame,
+            text=f"Crea la tarea de Windows '{TASK_NAME}' para ejecutar el Mantenimiento "
+            "Express en modo silencioso una vez al mes (sin abrir ventanas).",
+            font=("Segoe UI", 12),
+            text_color="#8a8a8a",
+        )
+        description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 10))
+
+        status_card = ctk.CTkFrame(frame)
+        status_card.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        status_card.grid_columnconfigure(1, weight=1)
+
+        self._scheduler_status_label = ctk.CTkLabel(
+            status_card,
+            text="Estado: consultando...",
+            font=("Segoe UI", 13),
+            text_color="#8a8a8a",
+            anchor="w",
+        )
+        self._scheduler_status_label.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(10, 2))
+
+        day_label = ctk.CTkLabel(status_card, text="Día del mes:", font=("Segoe UI", 13))
+        day_label.grid(row=1, column=0, sticky="w", padx=12, pady=(4, 2))
+        self._scheduler_day = ctk.CTkComboBox(
+            status_card,
+            width=80,
+            values=[str(day) for day in range(1, 29)],
+        )
+        self._scheduler_day.set("1")
+        self._scheduler_day.grid(row=1, column=1, sticky="w", padx=(4, 16), pady=(4, 2))
+
+        hour_label = ctk.CTkLabel(status_card, text="Hora:", font=("Segoe UI", 13))
+        hour_label.grid(row=2, column=0, sticky="w", padx=12, pady=(2, 12))
+        self._scheduler_hour = ctk.CTkComboBox(
+            status_card,
+            width=80,
+            values=[f"{hour:02d}:00" for hour in range(24)],
+        )
+        self._scheduler_hour.set("12:00")
+        self._scheduler_hour.grid(row=2, column=1, sticky="w", padx=(4, 16), pady=(2, 12))
+
+        self._scheduler_updating = True
+        self._scheduler_switch = ctk.CTkSwitch(
+            frame,
+            text="Mantenimiento mensual automático activado",
+            command=self._scheduler_toggle,
+        )
+        self._scheduler_switch.grid(row=3, column=0, sticky="w", padx=16, pady=(0, 8))
+
+        refresh_btn = ctk.CTkButton(
+            frame,
+            text="Actualizar estado",
+            command=self._scheduler_refresh_status,
+        )
+        refresh_btn.grid(row=4, column=0, sticky="w", padx=16, pady=(0, 8))
+
+        self._scheduler_log = self._section_log(frame, row=5, height=160)
+        self._scheduler_refresh_status()
+        return frame
+
+    def _scheduler_apply_status(self, status: Any) -> None:
+        """Reflect the queried task status into the switch and label."""
+        installed = bool(getattr(status, "installed", False))
+        detail = getattr(status, "detail", "") or ""
+        self._scheduler_status_label.configure(
+            text=(
+                f"Estado: ACTIVADA{' - ' + detail if detail and installed else ''}"
+                if installed
+                else f"Estado: desactivada{(' - ' + detail) if detail else ''}"
+            ),
+            text_color=_COLOR_OK if installed else "#8a8a8a",
+        )
+        previous = self._scheduler_updating
+        self._scheduler_updating = True
+        try:
+            if installed:
+                self._scheduler_switch.select()
+            else:
+                self._scheduler_switch.deselect()
+        finally:
+            self._scheduler_updating = previous
+        for error in getattr(status, "errors", []) or []:
+            self._append_log(self._scheduler_log, error, error=True)
+
+    def _scheduler_refresh_status(self) -> None:
+        """Query the scheduled-task status asynchronously."""
+
+        def _complete(status: Any) -> None:
+            try:
+                self.after(0, self._scheduler_apply_status, status)
+            except TclError:
+                pass
+
+        def _fail(error: Any) -> None:
+            try:
+                self.after(0, self._scheduler_status_error, error)
+            except TclError:
+                pass
+
+        self._task_scheduler.get_status_async(on_complete=_complete, on_error=_fail)
+
+    def _scheduler_status_error(self, error: Any) -> None:
+        """Log a scheduler-status query failure."""
+        self._log_error(self._scheduler_log, error)
+
+    def _scheduler_toggle(self) -> None:
+        """Enable or disable the monthly task following the switch."""
+        if self._scheduler_updating:
+            return
+        enabled = self._scheduler_switch.get() == 1
+        day = int(self._scheduler_day.get().strip() or "1")
+        hour_text = self._scheduler_hour.get().strip() or "12:00"
+        hour = int(hour_text.split(":")[0])
+
+        if enabled:
+            if not messagebox.askyesno(
+                "Programar mantenimiento",
+                f"Se creará la tarea '{TASK_NAME}' para ejecutar el mantenimiento "
+                f"express el día {day} de cada mes a las {hour:02d}:00 hs "
+                "(requiere administrador). ¿Continuar?",
+            ):
+                self._scheduler_switch.deselect()
+                return
+            self._append_log(self._scheduler_log, "Creando tarea programada...")
+            self._task_scheduler.enable_monthly_async(
+                day_of_month=day,
+                hour=hour,
+                minute=0,
+                on_complete=lambda result: self.after(0, self._scheduler_enabled, result),
+                on_error=lambda error: self.after(0, self._scheduler_status_error, error),
+            )
+        else:
+            if not messagebox.askyesno(
+                "Desprogramar mantenimiento",
+                f"Se eliminará la tarea '{TASK_NAME}'. ¿Continuar?",
+            ):
+                self._scheduler_switch.select()
+                return
+            self._append_log(self._scheduler_log, "Eliminando tarea programada...")
+            self._task_scheduler.disable_async(
+                on_complete=lambda result: self.after(0, self._scheduler_disabled, result),
+                on_error=lambda error: self.after(0, self._scheduler_status_error, error),
+            )
+
+    def _scheduler_enabled(self, result: CommandResult) -> None:
+        """Handle the enable outcome and refresh the status card."""
+        for line in self._format_command_result(result):
+            self._append_log(self._scheduler_log, line)
+        audit("scheduled_task", f"enable_ok={int(result.success)}")
+        self._scheduler_refresh_status()
+
+    def _scheduler_disabled(self, result: CommandResult) -> None:
+        """Handle the disable outcome and refresh the status card."""
+        for line in self._format_command_result(result):
+            self._append_log(self._scheduler_log, line)
+        audit("scheduled_task", f"disable_ok={int(result.success)}")
+        self._scheduler_refresh_status()
+
     def _on_close(self) -> None:
         """Stop background threads and destroy the window."""
         self._telemetry_active = False
+        if self._stress_test is not None and self._stress_test.running:
+            self._stress_test.stop()
+            time.sleep(0.2)
         self.destroy()
 
 

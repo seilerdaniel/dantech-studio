@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat as stat_module
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, TypeVar
@@ -120,6 +122,30 @@ class DiskUsage:
     free_gb: float = 0.0
     total_gb: float = 0.0
     percent: float = 0.0
+
+
+@dataclass
+class SpaceScanReport:
+    """Outcome of the quick heavy-space scan (WizTree-style breakdown).
+
+    ``folders`` holds the largest first-level directories of the root and
+    ``extensions`` the aggregated consumption per file extension; both are
+    sorted from heaviest to lightest. When the time budget expires the scan
+    stops early, ``truncated`` is set and partial sizes are kept.
+    """
+
+    root: str = "C:/"
+    elapsed_s: float = 0.0
+    truncated: bool = False
+    total_bytes: int = 0
+    files_seen: int = 0
+    folders: list[FolderSize] = field(default_factory=list)
+    extensions: list[tuple[str, int]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+class _ScanBudgetExceeded(Exception):
+    """Internal signal raised when the scan time budget runs out."""
 
 
 def _enum_to_label(value: object, mapping: dict[str, str]) -> str:
@@ -421,6 +447,123 @@ class DiskAnalyzer:
             pass
         return size, children
 
+    # ------------------------------------------------------------- space scan
+
+    def scan_space(
+        self,
+        root: Path = Path("C:/"),
+        time_budget_s: float = 90.0,
+        max_depth: int = 14,
+    ) -> SpaceScanReport:
+        """Quick heavy-space scan of a drive with extension breakdown.
+
+        Walks the tree with ``os.scandir``, skipping junctions/symlinks and
+        denied entries, until the wall-clock budget expires. Designed as a
+        WizTree-style triage: fast partial answers beat exact but slow ones.
+
+        Args:
+            root: Drive or directory to scan.
+            time_budget_s: Wall-clock limit before stopping early.
+            max_depth: Recursion cap; deeper content is under-counted on
+                pathological trees (e.g. nested ``node_modules``).
+
+        Returns:
+            A :class:`SpaceScanReport` with top folders, per-extension sizes
+            and a ``truncated`` flag when the budget cut the walk short.
+        """
+        ensure_windows()
+        started = time.monotonic()
+        report = SpaceScanReport(root=str(root))
+        ext_sizes: dict[str, int] = {}
+        state = {"denied": 0, "files": 0}
+
+        def _walk(directory: Path, depth: int) -> tuple[int, int]:
+            if depth > max_depth:
+                return 0, 0
+            if time.monotonic() - started > time_budget_s:
+                raise _ScanBudgetExceeded()
+            size = 0
+            files = 0
+            try:
+                with os.scandir(directory) as iterator:
+                    for entry in iterator:
+                        try:
+                            entry_stat = entry.stat(follow_symlinks=False)
+                            if entry.is_dir(follow_symlinks=False):
+                                if (
+                                    getattr(entry_stat, "st_file_attributes", 0)
+                                    & stat_module.FILE_ATTRIBUTE_REPARSE_POINT
+                                ):
+                                    continue
+                                sub_size, sub_files = _walk(Path(entry.path), depth + 1)
+                                size += sub_size
+                                files += sub_files
+                            elif entry.is_file(follow_symlinks=False):
+                                file_size = entry_stat.st_size
+                                size += file_size
+                                files += 1
+                                state["files"] += 1
+                                extension = (
+                                    os.path.splitext(entry.name)[1].lower()
+                                    or "[sin extensión]"
+                                )
+                                ext_sizes[extension] = (
+                                    ext_sizes.get(extension, 0) + file_size
+                                )
+                        except (PermissionError, OSError, FileNotFoundError):
+                            state["denied"] += 1
+            except (PermissionError, OSError, FileNotFoundError):
+                state["denied"] += 1
+            return size, files
+
+        try:
+            with os.scandir(root) as iterator:
+                top_entries = list(iterator)
+        except (PermissionError, OSError, FileNotFoundError) as exc:
+            report.errors.append(f"No se pudo listar {root}: {exc}")
+            report.elapsed_s = time.monotonic() - started
+            return report
+
+        folders: list[FolderSize] = []
+        try:
+            for entry in top_entries:
+                if time.monotonic() - started > time_budget_s:
+                    raise _ScanBudgetExceeded()
+                try:
+                    entry_stat = entry.stat(follow_symlinks=False)
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if (
+                        getattr(entry_stat, "st_file_attributes", 0)
+                        & stat_module.FILE_ATTRIBUTE_REPARSE_POINT
+                    ):
+                        continue
+                    size, files = _walk(Path(entry.path), 1)
+                    folders.append(
+                        FolderSize(path=str(Path(entry.path)), size_bytes=size, children=files)
+                    )
+                except (PermissionError, OSError, FileNotFoundError):
+                    state["denied"] += 1
+        except _ScanBudgetExceeded:
+            report.truncated = True
+
+        folders.sort(key=lambda folder: folder.size_bytes, reverse=True)
+        report.folders = folders
+        report.extensions = sorted(ext_sizes.items(), key=lambda item: item[1], reverse=True)
+        report.total_bytes = sum(folder.size_bytes for folder in folders)
+        report.files_seen = state["files"]
+        report.elapsed_s = time.monotonic() - started
+        if state["denied"]:
+            report.errors.append(
+                f"{state['denied']} entradas sin acceso fueron omitidas durante el escaneo."
+            )
+        if report.truncated:
+            report.errors.append(
+                f"Escaneo detenido al alcanzar el presupuesto de {time_budget_s:.0f} s; "
+                "los tamaños mostrados son parciales."
+            )
+        return report
+
     # ------------------------------------------------------------ disk usage
 
     def get_disk_usage(self) -> DiskUsage:
@@ -490,4 +633,36 @@ class DiskAnalyzer:
             on_complete,
             on_error,
             "top-folders",
+        )
+
+    def scan_space_async(
+        self,
+        root: Path = Path("C:/"),
+        time_budget_s: float = 90.0,
+        on_complete: Optional[Callable[[SpaceScanReport], None]] = None,
+        on_error: Optional[Callable[[Exception], None]] = None,
+    ) -> threading.Thread:
+        """Run ``scan_space`` in a daemon thread (slow disk walk).
+
+        Args:
+            root: Drive or directory to scan.
+            time_budget_s: Wall-clock limit before stopping early.
+            on_complete: Called with the :class:`SpaceScanReport` when done.
+            on_error: Called with the exception when the scan raises.
+
+        Returns:
+            The started daemon thread.
+        """
+        if on_complete is None:
+
+            def _noop(_result: SpaceScanReport) -> None:
+                return
+
+            on_complete = _noop
+
+        return _run_in_thread(
+            lambda: self.scan_space(root=root, time_budget_s=time_budget_s),
+            on_complete,
+            on_error,
+            "space-scan",
         )
