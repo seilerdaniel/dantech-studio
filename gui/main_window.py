@@ -1548,10 +1548,9 @@ class DanTechStudioApp(ctk.CTk):
         )
         description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
 
-        main = ctk.CTkFrame(frame, fg_color="transparent")
+        main = ctk.CTkScrollableFrame(frame, fg_color="transparent")
         main.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 4))
         main.grid_columnconfigure(1, weight=1)
-        main.grid_rowconfigure(0, weight=1)
 
         config = ctk.CTkFrame(main)
         config.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
@@ -1813,7 +1812,7 @@ class DanTechStudioApp(ctk.CTk):
         """Build the apps view: winget installer plus an uninstaller section."""
         frame = ctk.CTkFrame(self.content_panel, corner_radius=0)
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(4, weight=1)
+        frame.grid_rowconfigure(2, weight=1)
 
         title = self._section_title(frame, "Aplicaciones")
         title.grid(row=0, column=0, sticky="w", padx=16, pady=(20, 4))
@@ -1827,10 +1826,9 @@ class DanTechStudioApp(ctk.CTk):
         )
         description.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
 
-        main = ctk.CTkFrame(frame, fg_color="transparent")
-        main.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 4))
+        main = ctk.CTkScrollableFrame(frame, fg_color="transparent")
+        main.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 4))
         main.grid_columnconfigure(1, weight=1)
-        main.grid_rowconfigure(0, weight=1)
 
         install_col = ctk.CTkFrame(main)
         install_col.grid(row=0, column=0, sticky="nsw", padx=(0, 12))

@@ -32,11 +32,45 @@ except ImportError:  # pragma: no cover - guarded so reports fail gracefully
 #: keeps symlink/hardlink loops contained even if they are ever followed.
 _MAX_DEPTH = 8
 
-#: Access rights needed for ``OpenProcess``: QUERY_INFORMATION | QUERY_LIMITED_INFORMATION.
-_PROCESS_QUERY_RIGHTS = 0x0100 | 0x0008
+#: Access rights needed for the working-set trim: PROCESS_QUERY_INFORMATION
+#: (0x0400) | PROCESS_SET_QUOTA (0x0100), as required by both
+#: ``EmptyWorkingSet`` and ``SetProcessWorkingSetSize``.
+_PROCESS_QUERY_RIGHTS = 0x0400 | 0x0100
+
+#: ``SIZE_T`` max value: passing (-1, -1) to ``SetProcessWorkingSetSize``
+#: empties the working set (equivalent fallback to ``EmptyWorkingSet``).
+_SIZE_T_MAX = (1 << (ctypes.sizeof(ctypes.c_size_t) * 8)) - 1
 
 #: Process names never trimmed: Windows kernel/idle pseudo-processes.
 _SKIP_PROCESS_NAMES = {"system", "system idle process", "idle"}
+
+# Win32 function pointers with explicit prototypes (resolved once, lazily).
+_OpenProcess = _CloseHandle = _EmptyWorkingSet = _SetProcessWorkingSetSize = None
+if os.name == "nt":  # pragma: no cover - platform guard
+    from ctypes import wintypes
+
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _PSAPI = ctypes.WinDLL("psapi", use_last_error=True)
+
+    _OpenProcess = _KERNEL32.OpenProcess
+    _OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _OpenProcess.restype = wintypes.HANDLE
+
+    _CloseHandle = _KERNEL32.CloseHandle
+    _CloseHandle.argtypes = [wintypes.HANDLE]
+    _CloseHandle.restype = wintypes.BOOL
+
+    _EmptyWorkingSet = _PSAPI.EmptyWorkingSet
+    _EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+    _EmptyWorkingSet.restype = wintypes.BOOL
+
+    _SetProcessWorkingSetSize = _KERNEL32.SetProcessWorkingSetSize
+    _SetProcessWorkingSetSize.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    _SetProcessWorkingSetSize.restype = wintypes.BOOL
 
 _T = TypeVar("_T")
 
@@ -222,7 +256,12 @@ class MemoryOptimizer:
             report.errors.append(f"No se pudo acceder a {entry.path}: {exc}")
 
     def _trim_process(self, pid: int, name: str, reported_rss: int, report: RamReport) -> None:
-        """Trim one process working set via EmptyWorkingSet and measure freed RSS.
+        """Trim one process working set via Win32 and measure freed RSS.
+
+        The trim calls ``psapi.EmptyWorkingSet`` first; when the API reports
+        failure it falls back to ``kernel32.SetProcessWorkingSetSize(handle,
+        -1, -1)``, which releases the same physical pages. Both require a
+        handle opened with PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA.
 
         Args:
             pid: Process id to trim.
@@ -244,19 +283,27 @@ class MemoryOptimizer:
         trimmed = False
         handle = None
         try:
-            handle = ctypes.windll.kernel32.OpenProcess(_PROCESS_QUERY_RIGHTS, False, pid)
+            if _OpenProcess is None or _EmptyWorkingSet is None or _CloseHandle is None:
+                raise OSError("La API de Windows (kernel32/psapi) no esta disponible.")
+            handle = _OpenProcess(_PROCESS_QUERY_RIGHTS, False, pid)
             if not handle:
-                raise OSError("OpenProcess devolvio un handle nulo")
-            if ctypes.windll.psapi.EmptyWorkingSet(handle):
+                raise OSError(
+                    f"OpenProcess fallo (WinError {ctypes.get_last_error()})"
+                )
+            if _EmptyWorkingSet(handle):
+                trimmed = True
+            elif _SetProcessWorkingSetSize is not None and _SetProcessWorkingSetSize(
+                handle, _SIZE_T_MAX, _SIZE_T_MAX
+            ):
                 trimmed = True
             else:
-                raise OSError(ctypes.WinError())
-        except (AttributeError, OSError, ctypes.WinError) as exc:
+                raise OSError(f"WinError {ctypes.get_last_error()}")
+        except (AttributeError, OSError) as exc:
             report.errors.append(f"No se pudo recortar la memoria de {name} (pid {pid}): {exc}")
         finally:
             if handle:
                 try:
-                    ctypes.windll.kernel32.CloseHandle(handle)
+                    _CloseHandle(handle)
                 except (AttributeError, OSError):
                     pass
 
